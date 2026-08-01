@@ -26,19 +26,43 @@ import (
 // 核心配置区
 // ==========================================
 const (
-	// 固定的握手鉴权密钥
-	AuthToken = "ceemail"
+	// 注册接口的准入密钥（测试阶段暂不强制校验，见 registerHandler）。
+	// 可通过环境变量 REGISTER_AUTH_TOKEN 覆盖。
+	DefaultRegisterToken = "ceemail"
 
 	// 绑定的网关域名，用于申请 TLS 证书
 	DomainName = "mx.300031.xyz"
 
 	// 本地持久化保存已注册收件端的文件名
 	RegistryFile = "endpoints.json"
+
+	// 收件端超过此时长未续约（未重新握手/未探活成功）则视为失效并清理
+	EndpointTTL = 7 * 24 * time.Hour
 )
 
-// 注册的收件端
+// 注册接口的准入密钥，启动时从环境变量加载，兼容旧的硬编码默认值
+var registerToken = DefaultRegisterToken
+
+// 测试阶段默认不校验注册准入密钥，方便调试。
+// 生产环境设置环境变量 REQUIRE_REGISTER_AUTH=true 开启校验。
+var requireRegisterAuth = false
+
+// 从环境变量加载配置，覆盖硬编码默认值
+func loadConfigFromEnv() {
+	if v := os.Getenv("REGISTER_AUTH_TOKEN"); v != "" {
+		registerToken = v
+	}
+	if v := os.Getenv("REQUIRE_REGISTER_AUTH"); v == "true" || v == "1" {
+		requireRegisterAuth = true
+	}
+	log.Printf("注册准入校验: %v（测试阶段可设 REQUIRE_REGISTER_AUTH=true 开启）", requireRegisterAuth)
+}
+
+// 注册的收件端。每个 webhook 拥有独立的转发密钥（由主项目在握手时传入），
+// 转发邮件时使用这个密钥而不是网关自身的注册密钥，实现"每端点独立密钥"。
 type Endpoint struct {
 	WebhookURL string    `json:"webhook_url"`
+	AuthToken  string    `json:"auth_token"` // 转发邮件时携带的 X-Email-Auth-Token
 	LastSeen   time.Time `json:"last_seen"`
 	IsHealthy  bool      `json:"is_healthy"`
 }
@@ -53,33 +77,70 @@ var (
 // ==========================================
 func loadEndpoints() {
 	data, err := os.ReadFile(RegistryFile)
-	if err == nil {
-		var list []string
-		if err := json.Unmarshal(data, &list); err == nil {
-			mu.Lock()
-			for _, url := range list {
-				endpoints[url] = &Endpoint{
-					WebhookURL: url,
-					LastSeen:   time.Now(),
-					IsHealthy:  false, // 启动时设为 false，等待探活
-				}
-			}
-			mu.Unlock()
-			log.Printf("已从文件加载 %d 个收件端", len(list))
+	if err != nil {
+		return
+	}
+
+	// 新格式：完整 Endpoint 结构（含各自的 auth_token）
+	var full map[string]*Endpoint
+	if err := json.Unmarshal(data, &full); err == nil && len(full) > 0 {
+		mu.Lock()
+		for url, ep := range full {
+			ep.WebhookURL = url
+			ep.IsHealthy = false // 启动时设为 false，等待探活
+			endpoints[url] = ep
 		}
+		mu.Unlock()
+		log.Printf("已从文件加载 %d 个收件端", len(full))
+		return
+	}
+
+	// 兼容旧格式：仅 URL 列表，没有独立密钥时回退到 registerToken
+	var list []string
+	if err := json.Unmarshal(data, &list); err == nil {
+		mu.Lock()
+		for _, url := range list {
+			endpoints[url] = &Endpoint{
+				WebhookURL: url,
+				AuthToken:  registerToken,
+				LastSeen:   time.Now(),
+				IsHealthy:  false,
+			}
+		}
+		mu.Unlock()
+		log.Printf("已从文件加载 %d 个收件端（旧格式，已回退到默认密钥）", len(list))
 	}
 }
 
 func saveEndpoints() {
 	mu.RLock()
-	var list []string
-	for url := range endpoints {
-		list = append(list, url)
+	snapshot := make(map[string]*Endpoint, len(endpoints))
+	for url, ep := range endpoints {
+		epCopy := *ep
+		snapshot[url] = &epCopy
 	}
 	mu.RUnlock()
 
-	data, _ := json.MarshalIndent(list, "", "  ")
+	data, _ := json.MarshalIndent(snapshot, "", "  ")
 	os.WriteFile(RegistryFile, data, 0644)
+}
+
+// 清理长期未续约的收件端，避免 endpoints.json 无限增长
+func cleanupStaleEndpoints() {
+	mu.Lock()
+	removed := 0
+	for url, ep := range endpoints {
+		if time.Since(ep.LastSeen) > EndpointTTL {
+			delete(endpoints, url)
+			removed++
+			log.Printf("清理长期失效的收件端: %s (超过 %s 未续约)", url, EndpointTTL)
+		}
+	}
+	mu.Unlock()
+
+	if removed > 0 {
+		saveEndpoints()
+	}
 }
 
 // ==========================================
@@ -87,18 +148,81 @@ func saveEndpoints() {
 // ==========================================
 
 // 握手注册接口 (POST /register)
-// Body JSON: {"webhook_url": "https://mail.amaeru.com/api/email/incoming"}
-// Header: X-Email-Auth-Token: YOUR_SUPER_SECRET_TOKEN
+// Body JSON: {"webhook_url": "https://mail.example.com/api/email/incoming", "auth_token": "xxx"}
+// Header: X-Email-Auth-Token: 注册准入密钥（测试阶段可不带，见下方说明）
+//
+// auth_token 是主项目自己生成、用于后续接收邮件时校验来源的密钥
+// （对应主项目 EMAIL_WEBHOOK_SECRET / inbound_routers.secret_key）。
+// 网关会把它和 webhook_url 绑定保存，转发邮件时使用这个密钥而不是
+// 网关自身的注册准入密钥，从而让两端真正共享同一份密钥。
+//
+// 【测试阶段】REQUIRE_REGISTER_AUTH=false（默认）时不校验 X-Email-Auth-Token，
+// 方便调试；生产环境应设置 REQUIRE_REGISTER_AUTH=true 并配置 REGISTER_AUTH_TOKEN。
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	token := r.Header.Get("X-Email-Auth-Token")
-	if token != AuthToken {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+	if requireRegisterAuth {
+		token := r.Header.Get("X-Email-Auth-Token")
+		if token != registerToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+	}
+
+	var req struct {
+		WebhookURL string `json:"webhook_url"`
+		AuthToken  string `json:"auth_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.WebhookURL == "" {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
+	}
+
+	// auth_token 未提供时回退到注册准入密钥，保持向后兼容
+	authToken := req.AuthToken
+	if authToken == "" {
+		authToken = registerToken
+	}
+
+	mu.Lock()
+	_, existed := endpoints[req.WebhookURL]
+	endpoints[req.WebhookURL] = &Endpoint{
+		WebhookURL: req.WebhookURL,
+		AuthToken:  authToken,
+		LastSeen:   time.Now(),
+		IsHealthy:  true, // 刚注册/续约认为存活，等待下一轮探活确认
+	}
+	mu.Unlock()
+
+	if existed {
+		log.Printf("收件端重新握手（幂等更新密钥）: %s", req.WebhookURL)
+	} else {
+		log.Printf("注册了新的收件端: %s", req.WebhookURL)
+	}
+
+	saveEndpoints()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "registered successfully"})
+}
+
+// 注销接口 (POST /unregister)，供主项目主动下线某个 webhook 时调用，
+// 避免只能被动等待 TTL 过期清理。
+func unregisterHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if requireRegisterAuth {
+		token := r.Header.Get("X-Email-Auth-Token")
+		if token != registerToken {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
 	}
 
 	var req struct {
@@ -110,20 +234,17 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.Lock()
-	if _, exists := endpoints[req.WebhookURL]; !exists {
-		log.Printf("注册了新的收件端: %s", req.WebhookURL)
-	}
-	endpoints[req.WebhookURL] = &Endpoint{
-		WebhookURL: req.WebhookURL,
-		LastSeen:   time.Now(),
-		IsHealthy:  true, // 刚注册认为存活
-	}
+	_, existed := endpoints[req.WebhookURL]
+	delete(endpoints, req.WebhookURL)
 	mu.Unlock()
 
-	saveEndpoints()
+	if existed {
+		saveEndpoints()
+		log.Printf("收件端已注销: %s", req.WebhookURL)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "registered successfully"})
+	json.NewEncoder(w).Encode(map[string]bool{"removed": existed})
 }
 
 // 状态面板 (GET /)
@@ -172,38 +293,75 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 // ==========================================
 // 探活机制 (后台轮询)
 // ==========================================
+//
+// 说明：GET 请求探测 webhook 无法反映真实可用性——主项目 /api/email/incoming
+// 只注册了 POST handler，GET 会被路由框架直接 404，而 404 在旧逻辑里被当作"健康"，
+// 因此鉴权失败(401/403)、方法不允许(404/405)等情况全部被误判为健康。
+//
+// 改为发送一个空的 POST 请求（不带 Content-Length 邮件体），并携带该端点自己的
+// auth_token。真实的收信端点在这种请求下预期返回 400（邮件内容为空）而不是
+// 401/403/404/5xx，说明鉴权和路由都是通的；返回 401/403 说明密钥不匹配；
+// 5xx 或网络错误才视为不健康。
+func probeEndpoint(ep *Endpoint) bool {
+	req, err := http.NewRequest("POST", ep.WebhookURL, bytes.NewReader(nil))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("User-Agent", "Email-Gateway-HealthCheck")
+	req.Header.Set("X-Email-Auth-Token", ep.AuthToken)
+	req.Header.Set("X-Health-Check", "1")
+	req.Header.Set("Content-Type", "message/rfc822")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	// 5xx 说明后端本身出问题；401/403 说明密钥不匹配但服务是活的——
+	// 这里仍标记为不健康，因为密钥不对邮件也投不进去，暴露出来能及时发现配置错误。
+	if resp.StatusCode >= 500 {
+		return false
+	}
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		log.Printf("[%s] 健康检查发现鉴权失败（密钥可能不一致），标记为不健康", ep.WebhookURL)
+		return false
+	}
+	return true
+}
+
 func startHealthCheck() {
 	ticker := time.NewTicker(15 * time.Second)
-	for range ticker.C {
-		mu.RLock()
-		var urls []string
-		for url := range endpoints {
-			urls = append(urls, url)
-		}
-		mu.RUnlock()
+	cleanupTicker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	defer cleanupTicker.Stop()
 
-		for _, url := range urls {
-			// 对 webhook 发送空 POST 或 GET 请求探活
-			req, _ := http.NewRequest("GET", url, nil)
-			req.Header.Set("User-Agent", "Email-Gateway-HealthCheck")
+	for {
+		select {
+		case <-ticker.C:
+			mu.RLock()
+			snapshot := make([]*Endpoint, 0, len(endpoints))
+			for _, ep := range endpoints {
+				epCopy := *ep
+				snapshot = append(snapshot, &epCopy)
+			}
+			mu.RUnlock()
 
-			client := &http.Client{Timeout: 5 * time.Second}
-			resp, err := client.Do(req)
+			for _, ep := range snapshot {
+				healthy := probeEndpoint(ep)
 
-			mu.Lock()
-			ep, exists := endpoints[url]
-			if exists {
-				if err != nil || resp.StatusCode >= 500 {
-					ep.IsHealthy = false
-				} else {
-					ep.IsHealthy = true
-					ep.LastSeen = time.Now()
+				mu.Lock()
+				if cur, exists := endpoints[ep.WebhookURL]; exists {
+					cur.IsHealthy = healthy
+					if healthy {
+						cur.LastSeen = time.Now()
+					}
 				}
+				mu.Unlock()
 			}
-			mu.Unlock()
-			if resp != nil {
-				resp.Body.Close()
-			}
+		case <-cleanupTicker.C:
+			cleanupStaleEndpoints()
 		}
 	}
 }
@@ -389,7 +547,7 @@ func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 
 type Session struct {
 	From     string
-	To       string
+	To       []string // 一封邮件可能有多个 RCPT TO，必须全部收集，否则会丢信
 	ClientIP net.IP
 	Helo     string
 }
@@ -404,27 +562,39 @@ func (s *Session) Mail(from string, opts *smtp.MailOptions) error {
 }
 
 func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
-	s.To = to
+	// 追加而非覆盖：同一封邮件可能同时投给多个收件人（RCPT TO 多次），
+	// 之前的实现直接赋值会丢掉除最后一个之外的所有收件人。
+	for _, existing := range s.To {
+		if existing == to {
+			return nil // 去重，避免重复 RCPT TO 导致重复转发
+		}
+	}
+	s.To = append(s.To, to)
 	return nil
 }
 
 func (s *Session) Data(r io.Reader) error {
 	mu.RLock()
-	var healthyURLs []string
-	for url, ep := range endpoints {
+	var healthyEndpoints []Endpoint
+	for _, ep := range endpoints {
 		if ep.IsHealthy {
-			healthyURLs = append(healthyURLs, url)
+			healthyEndpoints = append(healthyEndpoints, *ep)
 		}
 	}
 	mu.RUnlock()
 
-	if len(healthyURLs) == 0 {
+	if len(healthyEndpoints) == 0 {
 		log.Printf("拒绝接收邮件：无健康的收件端")
 		return &smtp.SMTPError{
 			Code:         451,
 			EnhancedCode: smtp.EnhancedCode{4, 3, 0},
 			Message:      "Temporary local problem - no active backend",
 		}
+	}
+
+	if len(s.To) == 0 {
+		log.Printf("拒绝接收邮件：没有收件人")
+		return &smtp.SMTPError{Code: 554, Message: "No valid recipients"}
 	}
 
 	// 限制读取最大 26MB
@@ -435,7 +605,7 @@ func (s *Session) Data(r io.Reader) error {
 	}
 
 	rawEmail := buf.Bytes()
-	log.Printf("收到邮件: %s -> %s, 开始验证...", s.From, s.To)
+	log.Printf("收到邮件: %s -> %v, 开始验证...", s.From, s.To)
 
 	// 执行邮件验证（在转发前完成，此时发件方 IP 尚未丢失）
 	spfResult, spfDomain := verifySPF(s.ClientIP, s.Helo, s.From)
@@ -454,69 +624,96 @@ func (s *Session) Data(r io.Reader) error {
 	log.Printf("验证结果: SPF=%s (ip=%v domain=%s), DKIM=%s %v, DMARC=%s",
 		spfResult, s.ClientIP, spfDomain, dkimResult, dkimDomains, dmarcResult)
 
-	log.Printf("开始分发给 %d 个收件端...", len(healthyURLs))
+	log.Printf("开始分发给 %d 个收件端 x %d 个收件人...", len(healthyEndpoints), len(s.To))
+
+	type deliveryResult struct {
+		accepted bool
+		notFound bool
+	}
 
 	var wg sync.WaitGroup
 	var muResult sync.Mutex
-	anyAccepted := false
-	allNotFound := true
+	// 按收件人记录投递结果，一个收件人的失败不应影响其他收件人的判定
+	results := make(map[string]*deliveryResult, len(s.To))
+	for _, to := range s.To {
+		results[to] = &deliveryResult{notFound: true}
+	}
 
-	// 并发投递给所有存活的后端
-	for _, url := range healthyURLs {
-		wg.Add(1)
-		go func(webhookURL string) {
-			defer wg.Done()
+	// 对每个收件人 x 每个健康端点分别投递，
+	// 避免像旧实现那样把多个 RCPT TO 压缩成一个 X-Forwarded-To 而丢信。
+	for _, to := range s.To {
+		for _, ep := range healthyEndpoints {
+			wg.Add(1)
+			go func(webhookURL, authToken, rcptTo string) {
+				defer wg.Done()
 
-			req, err := http.NewRequest("POST", webhookURL, bytes.NewReader(rawEmail))
-			if err != nil {
-				return
-			}
-			req.Header.Set("X-Email-Auth-Token", AuthToken)
-			req.Header.Set("X-Forwarded-From", s.From)
-			req.Header.Set("X-Forwarded-To", s.To)
-			req.Header.Set("Content-Type", "message/rfc822")
+				req, err := http.NewRequest("POST", webhookURL, bytes.NewReader(rawEmail))
+				if err != nil {
+					return
+				}
+				req.Header.Set("X-Email-Auth-Token", authToken)
+				req.Header.Set("X-Forwarded-From", s.From)
+				req.Header.Set("X-Forwarded-To", rcptTo)
+				req.Header.Set("Content-Type", "message/rfc822")
 
-			// 添加验证结果头
-			req.Header.Set("X-SPF-Result", verification.SPFResult)
-			req.Header.Set("X-DKIM-Result", verification.DKIMResult)
-			req.Header.Set("X-DMARC-Result", verification.DMARCResult)
-			req.Header.Set("X-Auth-Results", verification.AuthResults)
+				// 添加验证结果头
+				req.Header.Set("X-SPF-Result", verification.SPFResult)
+				req.Header.Set("X-DKIM-Result", verification.DKIMResult)
+				req.Header.Set("X-DMARC-Result", verification.DMARCResult)
+				req.Header.Set("X-Auth-Results", verification.AuthResults)
 
-			client := &http.Client{Timeout: 30 * time.Second}
-			resp, err := client.Do(req)
-			if err != nil {
-				log.Printf("[%s] 投递失败: %v", webhookURL, err)
-				return
-			}
-			defer resp.Body.Close()
+				client := &http.Client{Timeout: 30 * time.Second}
+				resp, err := client.Do(req)
+				if err != nil {
+					log.Printf("[%s] 投递给 %s 失败: %v", webhookURL, rcptTo, err)
+					muResult.Lock()
+					results[rcptTo].notFound = false // 网络错误不等于"无此账号"，需要重试
+					muResult.Unlock()
+					return
+				}
+				defer resp.Body.Close()
 
-			muResult.Lock()
-			defer muResult.Unlock()
+				muResult.Lock()
+				defer muResult.Unlock()
 
-			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				anyAccepted = true
-				allNotFound = false
-			} else if resp.StatusCode == 404 {
-				// 后端明确表示找不到该用户，不视为严重错误，只是此后端不处理
-			} else {
-				// 其他 4xx/5xx 错误
-				allNotFound = false
-			}
-		}(url)
+				res := results[rcptTo]
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					res.accepted = true
+					res.notFound = false
+				} else if resp.StatusCode == 404 {
+					// 该后端明确表示找不到该收件人，保留 notFound，交给其他后端判断
+				} else {
+					// 其他 4xx/5xx 错误，不算"无此账号"
+					res.notFound = false
+				}
+			}(ep.WebhookURL, ep.AuthToken, to)
+		}
 	}
 
 	wg.Wait()
+
+	// 逐个收件人判定投递结果，只要有一个收件人成功即可返回成功，
+	// 让 SMTP 客户端认为整体投递成功（细粒度的按收件人拒绝会更复杂，
+	// 目前场景下同一域名的收件人通常落在同一批后端，先满足"不丢信"）。
+	anyAccepted := false
+	allNotFound := true
+	for _, res := range results {
+		if res.accepted {
+			anyAccepted = true
+			allNotFound = false
+		} else if !res.notFound {
+			allNotFound = false
+		}
+	}
 
 	if anyAccepted {
 		log.Printf("邮件成功投递。")
 		return nil
 	} else if allNotFound {
-		// 所有存活的后端都返回 404，说明没有任何账号匹配，退信
-		log.Printf("所有收件端均无此账号: %s", s.To)
+		log.Printf("所有收件端均无匹配账号: %v", s.To)
 		return &smtp.SMTPError{Code: 550, Message: "User unknown"}
 	}
 
-	// 投递过程中发生内部错误，让发件方重试
 	log.Printf("邮件分发遭遇错误，要求发件方重试。")
 	return &smtp.SMTPError{Code: 451, Message: "Backend processing error"}
 }
@@ -524,7 +721,7 @@ func (s *Session) Data(r io.Reader) error {
 // 只清空信封，ClientIP/Helo 属于连接级信息，同一连接可投递多封邮件
 func (s *Session) Reset() {
 	s.From = ""
-	s.To = ""
+	s.To = nil
 }
 func (s *Session) Logout() error {
 	return nil
@@ -534,6 +731,7 @@ func (s *Session) Logout() error {
 // Main 启动
 // ==========================================
 func main() {
+	loadConfigFromEnv()
 	loadEndpoints()
 	go startHealthCheck()
 
@@ -574,7 +772,8 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", statusHandler)
-	mux.HandleFunc("/register", registerHandler) // 供后端主动注册使用
+	mux.HandleFunc("/register", registerHandler)     // 供后端主动注册/续约使用
+	mux.HandleFunc("/unregister", unregisterHandler)  // 供后端主动下线 webhook 使用
 
 	httpServer := &http.Server{
 		Addr: ":8088",
