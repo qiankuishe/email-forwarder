@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -329,10 +330,39 @@ func main() {
 	loadEndpoints()
 	go startHealthCheck()
 
-	certManager := autocert.Manager{
-		Prompt:     autocert.AcceptTOS,
-		HostPolicy: autocert.HostWhitelist(DomainName),
-		Cache:      autocert.DirCache("./certs"),
+	// 尝试加载手动配置的证书
+	certFile := fmt.Sprintf("./certs/%s/%s", DomainName, DomainName)
+	keyFile := fmt.Sprintf("./certs/%s/%s.key", DomainName, DomainName)
+
+	var tlsConfig *tls.Config
+
+	// 检查是否存在手动配置的证书
+	if _, err := os.Stat(certFile); err == nil {
+		if _, err := os.Stat(keyFile); err == nil {
+			log.Printf("发现手动配置的证书文件，使用手动证书")
+			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+			if err != nil {
+				log.Fatalf("加载证书失败: %v", err)
+			}
+			tlsConfig = &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				ServerName:   DomainName,
+			}
+			log.Printf("手动证书加载成功")
+		}
+	}
+
+	// 如果没有手动证书，使用 autocert
+	var certManager *autocert.Manager
+	if tlsConfig == nil {
+		log.Printf("未找到手动证书，使用 Let's Encrypt 自动证书")
+		certManager = &autocert.Manager{
+			Prompt:     autocert.AcceptTOS,
+			HostPolicy: autocert.HostWhitelist(DomainName),
+			Cache:      autocert.DirCache("./certs"),
+		}
+		tlsConfig = certManager.TLSConfig()
+		tlsConfig.ServerName = DomainName
 	}
 
 	mux := http.NewServeMux()
@@ -340,9 +370,16 @@ func main() {
 	mux.HandleFunc("/register", registerHandler) // 供后端主动注册使用
 
 	httpServer := &http.Server{
-		Addr:    ":80",
-		Handler: certManager.HTTPHandler(mux),
+		Addr: ":80",
 	}
+
+	// 如果使用 autocert，HTTP 服务器需要处理证书验证
+	if certManager != nil {
+		httpServer.Handler = certManager.HTTPHandler(mux)
+	} else {
+		httpServer.Handler = mux
+	}
+
 	go func() {
 		log.Printf("启动 HTTP 状态/注册面板于 :80")
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -361,8 +398,7 @@ func main() {
 	s.MaxRecipients = 50
 	s.AllowInsecureAuth = false
 
-	s.TLSConfig = certManager.TLSConfig()
-	s.TLSConfig.ServerName = DomainName
+	s.TLSConfig = tlsConfig
 
 	log.Printf("启动 SMTP 服务于 :25，域名: %s", DomainName)
 	if err := s.ListenAndServe(); err != nil {
