@@ -370,7 +370,7 @@ func main() {
 	mux.HandleFunc("/register", registerHandler) // 供后端主动注册使用
 
 	httpServer := &http.Server{
-		Addr: ":80",
+		Addr: ":8088",
 	}
 
 	// 如果使用 autocert，HTTP 服务器需要处理证书验证
@@ -381,7 +381,7 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("启动 HTTP 状态/注册面板于 :80")
+		log.Printf("启动 HTTP 状态/注册面板于 :8088")
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTP 服务失败: %v", err)
 		}

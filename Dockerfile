@@ -24,8 +24,8 @@ WORKDIR /app
 # 从构建器中复制二进制文件
 COPY --from=builder /app/mail-gateway .
 
-# 暴露端口 (25: SMTP, 80: HTTP 验证及状态面板)
-EXPOSE 25 80
+# 暴露端口 (25: SMTP, 8088: HTTP 状态面板及注册接口)
+EXPOSE 25 8088
 
 # 运行程序
 CMD ["./mail-gateway"]

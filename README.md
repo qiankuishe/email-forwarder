@@ -19,7 +19,7 @@
 docker run -d \
   --name email-forwarder \
   -p 25:25 \
-  -p 80:80 \
+  -p 8088:8088 \
   -v $(pwd)/certs:/app/certs \
   -v $(pwd)/endpoints.json:/app/endpoints.json \
   --restart unless-stopped \
@@ -50,7 +50,7 @@ docker-compose down
 - **域名**: `mx.300031.xyz`
 - **认证密钥**: `ceemail`
 - **SMTP 端口**: 25
-- **HTTP 端口**: 80
+- **HTTP 端口**: 8088
 
 修改配置需要重新构建镜像或使用环境变量（未来版本支持）。
 
@@ -59,7 +59,7 @@ docker-compose down
 收件端需要向网关发送握手请求来注册：
 
 ```bash
-curl -X POST https://mx.300031.xyz/register \
+curl -X POST http://mx.300031.xyz:8088/register \
   -H "X-Email-Auth-Token: ceemail" \
   -H "Content-Type: application/json" \
   -d '{"webhook_url": "https://your-backend.com/api/email/incoming"}'
@@ -73,7 +73,7 @@ curl -X POST https://mx.300031.xyz/register \
 
 ## 状态监控
 
-访问 `http://mx.300031.xyz/` 查看网关状态：
+访问 `http://mx.300031.xyz:8088/` 查看网关状态：
 - **2: 连接成功** - 至少有一个健康的收件端
 - **1: 未连接** - 没有健康的收件端
 
@@ -100,7 +100,7 @@ mx.300031.xyz. A <服务器公网IP>
 
 确保服务器防火墙开放以下端口：
 - **25** - SMTP 邮件接收
-- **80** - HTTP（用于 Let's Encrypt 证书验证和状态面板）
+- **8088** - HTTP 状态面板和注册接口
 
 ## 邮件转发流程
 
