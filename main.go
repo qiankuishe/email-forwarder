@@ -9,7 +9,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/mail"
 	"os"
 	"strings"
 	"sync"
