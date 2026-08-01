@@ -20,10 +20,10 @@ import (
 // ==========================================
 const (
 	// 固定的握手鉴权密钥
-	AuthToken = "YOUR_SUPER_SECRET_TOKEN"
+	AuthToken = "ceemail"
 
 	// 绑定的网关域名，用于申请 TLS 证书
-	DomainName = "mx.amaeru.com"
+	DomainName = "mx.300031.xyz"
 
 	// 本地持久化保存已注册收件端的文件名
 	RegistryFile = "endpoints.json"
