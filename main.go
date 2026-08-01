@@ -251,11 +251,6 @@ func verifySPF(from string, clientIP string) string {
 
 // 验证 DKIM
 func verifyDKIM(rawEmail []byte) string {
-	msg, err := mail.ReadMessage(bytes.NewReader(rawEmail))
-	if err != nil {
-		return "none"
-	}
-
 	// 使用 go-msgauth 的 DKIM 验证
 	verifications, err := dkim.Verify(bytes.NewReader(rawEmail))
 	if err != nil || len(verifications) == 0 {
