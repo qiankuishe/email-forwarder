@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  mail-gateway:
+    build: .
+    image: mail-gateway:latest
+    container_name: mail-gateway
+    restart: unless-stopped
+    ports:
+      # 必须映射到主机的 25 端口，否则外部无法投递邮件
+      - "25:25"
+      # 必须映射到主机的 80 端口，用于状态查看和 Let's Encrypt 证书申请 (HTTP-01)
+      - "80:80"
+    volumes:
+      # 挂载宿主机目录，持久化保存申请下来的 TLS 证书，防止重启频繁申请被拉黑
+      - ./certs:/app/certs
