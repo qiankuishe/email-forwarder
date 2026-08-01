@@ -9,11 +9,13 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/mail"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	"blitiri.com.ar/go/spf"
 	"github.com/emersion/go-msgauth/dkim"
 	"github.com/emersion/go-msgauth/dmarc"
 	"github.com/emersion/go-smtp"
@@ -216,85 +218,154 @@ type EmailVerification struct {
 	AuthResults string
 }
 
-// 验证 SPF
-func verifySPF(from string, clientIP string) string {
-	// 提取发件人域名
-	parts := strings.Split(from, "@")
-	if len(parts) != 2 {
-		return "none"
+// 取邮箱地址的域名部分
+func domainOf(addr string) string {
+	addr = strings.Trim(addr, "<> ")
+	i := strings.LastIndex(addr, "@")
+	if i < 0 || i == len(addr)-1 {
+		return ""
 	}
-	domain := strings.Trim(parts[1], "<>")
-
-	// 简化的 SPF 检查：查询 DNS TXT 记录
-	txtRecords, err := net.LookupTXT(domain)
-	if err != nil {
-		return "none"
-	}
-
-	// 查找 SPF 记录
-	for _, txt := range txtRecords {
-		if strings.HasPrefix(txt, "v=spf1") {
-			// 简单判断：包含 +all 或 ~all
-			if strings.Contains(txt, "+all") {
-				return "pass"
-			} else if strings.Contains(txt, "~all") {
-				return "softfail"
-			} else if strings.Contains(txt, "-all") {
-				return "fail"
-			}
-			return "neutral"
-		}
-	}
-	return "none"
+	return strings.ToLower(addr[i+1:])
 }
 
-// 验证 DKIM
-func verifyDKIM(rawEmail []byte) string {
-	// 使用 go-msgauth 的 DKIM 验证
-	verifications, err := dkim.Verify(bytes.NewReader(rawEmail))
-	if err != nil || len(verifications) == 0 {
-		return "none"
+// 取 RFC5322 From 头的域名。DMARC 判定的是这个域，
+// 而不是信封发件人（MAIL FROM），两者可以不同。
+func headerFromDomain(rawEmail []byte) string {
+	msg, err := mail.ReadMessage(bytes.NewReader(rawEmail))
+	if err != nil {
+		return ""
+	}
+	list, err := msg.Header.AddressList("From")
+	if err != nil || len(list) == 0 {
+		return ""
+	}
+	return domainOf(list[0].Address)
+}
+
+// DMARC 对齐检查。relaxed 模式下只要组织域一致即可，
+// strict 模式要求完全相同。
+// 注意：这里用「标签边界后缀匹配」近似组织域，没有引入公共后缀表(PSL)，
+// 因此对 example.co.uk 这类多级后缀域名判定偏宽松。
+func domainsAligned(authDomain, fromDomain string, strict bool) bool {
+	if authDomain == "" || fromDomain == "" {
+		return false
+	}
+	authDomain = strings.ToLower(strings.TrimSuffix(authDomain, "."))
+	fromDomain = strings.ToLower(strings.TrimSuffix(fromDomain, "."))
+	if authDomain == fromDomain {
+		return true
+	}
+	if strict {
+		return false
+	}
+	return strings.HasSuffix(authDomain, "."+fromDomain) ||
+		strings.HasSuffix(fromDomain, "."+authDomain)
+}
+
+// 真实 SPF 判定：依赖发件方 IP、EHLO 域和信封发件人。
+// 返回 (结果, 参与判定的域名)，域名供 DMARC 对齐使用。
+func verifySPF(clientIP net.IP, helo, mailFrom string) (string, string) {
+	sender := strings.Trim(mailFrom, "<> ")
+	domain := domainOf(sender)
+
+	// 空信封发件人（退信场景）按 RFC 7208 回落到 EHLO 域
+	if domain == "" {
+		domain = strings.ToLower(strings.TrimSuffix(helo, "."))
+		if domain == "" {
+			return "none", ""
+		}
+		sender = "postmaster@" + domain
 	}
 
-	// 检查所有签名
+	if clientIP == nil {
+		return "none", domain
+	}
+
+	res, _ := spf.CheckHostWithSender(clientIP, helo, sender)
+	switch res {
+	case spf.Pass:
+		return "pass", domain
+	case spf.Fail:
+		return "fail", domain
+	case spf.SoftFail:
+		return "softfail", domain
+	case spf.Neutral:
+		return "neutral", domain
+	case spf.TempError:
+		return "temperror", domain
+	case spf.PermError:
+		return "permerror", domain
+	default:
+		return "none", domain
+	}
+}
+
+// DKIM 校验，返回 (结果, 校验通过的签名域列表)
+func verifyDKIM(rawEmail []byte) (string, []string) {
+	verifications, err := dkim.Verify(bytes.NewReader(rawEmail))
+	if err != nil {
+		return "temperror", nil
+	}
+	if len(verifications) == 0 {
+		return "none", nil
+	}
+
+	var passed []string
 	for _, v := range verifications {
 		if v.Err == nil {
-			return "pass"
+			passed = append(passed, v.Domain)
 		}
 	}
-	return "fail"
+	if len(passed) > 0 {
+		return "pass", passed
+	}
+	return "fail", nil
 }
 
-// 验证 DMARC
-func verifyDMARC(from string) string {
-	parts := strings.Split(from, "@")
-	if len(parts) != 2 {
-		return "none"
+// 查 DMARC 记录，沿父域回退一级（近似组织域）
+func lookupDMARC(fromDomain string) *dmarc.Record {
+	candidates := []string{fromDomain}
+	if labels := strings.Split(fromDomain, "."); len(labels) > 2 {
+		candidates = append(candidates, strings.Join(labels[1:], "."))
 	}
-	domain := strings.Trim(parts[1], "<>")
-
-	// 查询 _dmarc.domain 的 TXT 记录
-	dmarcDomain := "_dmarc." + domain
-	txtRecords, err := net.LookupTXT(dmarcDomain)
-	if err != nil {
-		return "none"
-	}
-
-	// 查找 DMARC 记录
-	for _, txt := range txtRecords {
-		if strings.HasPrefix(txt, "v=DMARC1") {
-			record, err := dmarc.Parse(txt)
-			if err != nil {
-				return "none"
-			}
-			// 如果有 DMARC 记录，根据策略返回结果
-			if record.Policy == dmarc.PolicyNone {
-				return "pass"
-			}
-			return "pass" // 有策略就算通过
+	for _, d := range candidates {
+		if rec, err := dmarc.Lookup(d); err == nil && rec != nil {
+			return rec
 		}
 	}
-	return "none"
+	return nil
+}
+
+// 真实 DMARC 判定：要求 SPF 或 DKIM 至少一项 pass 且与 From 域对齐
+func verifyDMARC(rawEmail []byte, spfResult, spfDomain, dkimResult string, dkimDomains []string) string {
+	fromDomain := headerFromDomain(rawEmail)
+	if fromDomain == "" {
+		return "none"
+	}
+
+	rec := lookupDMARC(fromDomain)
+	if rec == nil {
+		// 没有发布 DMARC 记录，无策略可依
+		return "none"
+	}
+
+	spfOK := spfResult == "pass" &&
+		domainsAligned(spfDomain, fromDomain, rec.SPFAlignment == dmarc.AlignmentStrict)
+
+	dkimOK := false
+	if dkimResult == "pass" {
+		for _, d := range dkimDomains {
+			if domainsAligned(d, fromDomain, rec.DKIMAlignment == dmarc.AlignmentStrict) {
+				dkimOK = true
+				break
+			}
+		}
+	}
+
+	if spfOK || dkimOK {
+		return "pass"
+	}
+	return "fail"
 }
 
 // ==========================================
@@ -303,12 +374,24 @@ func verifyDMARC(from string) string {
 type Backend struct{}
 
 func (be *Backend) NewSession(c *smtp.Conn) (smtp.Session, error) {
-	return &Session{}, nil
+	s := &Session{}
+	// 记录发件方 IP 与 HELO，SPF 判定必须依赖这两项
+	if c != nil {
+		if conn := c.Conn(); conn != nil {
+			if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+				s.ClientIP = addr.IP
+			}
+		}
+		s.Helo = c.Hostname()
+	}
+	return s, nil
 }
 
 type Session struct {
-	From string
-	To   string
+	From     string
+	To       string
+	ClientIP net.IP
+	Helo     string
 }
 
 func (s *Session) AuthPlain(username, password string) error {
@@ -354,20 +437,22 @@ func (s *Session) Data(r io.Reader) error {
 	rawEmail := buf.Bytes()
 	log.Printf("收到邮件: %s -> %s, 开始验证...", s.From, s.To)
 
-	// 执行邮件验证
+	// 执行邮件验证（在转发前完成，此时发件方 IP 尚未丢失）
+	spfResult, spfDomain := verifySPF(s.ClientIP, s.Helo, s.From)
+	dkimResult, dkimDomains := verifyDKIM(rawEmail)
+	dmarcResult := verifyDMARC(rawEmail, spfResult, spfDomain, dkimResult, dkimDomains)
+
 	verification := EmailVerification{
-		SPFResult:  verifySPF(s.From, "unknown"), // 客户端IP在此处无法获取，可以后续优化
-		DKIMResult: verifyDKIM(rawEmail),
-		DMARCResult: verifyDMARC(s.From),
+		SPFResult:   spfResult,
+		DKIMResult:  dkimResult,
+		DMARCResult: dmarcResult,
 	}
 	verification.AuthResults = fmt.Sprintf(
-		"spf=%s; dkim=%s; dmarc=%s",
-		verification.SPFResult,
-		verification.DKIMResult,
-		verification.DMARCResult,
+		"%s; spf=%s smtp.mailfrom=%s; dkim=%s; dmarc=%s",
+		DomainName, spfResult, spfDomain, dkimResult, dmarcResult,
 	)
-	log.Printf("验证结果: SPF=%s, DKIM=%s, DMARC=%s",
-		verification.SPFResult, verification.DKIMResult, verification.DMARCResult)
+	log.Printf("验证结果: SPF=%s (ip=%v domain=%s), DKIM=%s %v, DMARC=%s",
+		spfResult, s.ClientIP, spfDomain, dkimResult, dkimDomains, dmarcResult)
 
 	log.Printf("开始分发给 %d 个收件端...", len(healthyURLs))
 
@@ -436,7 +521,11 @@ func (s *Session) Data(r io.Reader) error {
 	return &smtp.SMTPError{Code: 451, Message: "Backend processing error"}
 }
 
-func (s *Session) Reset() {}
+// 只清空信封，ClientIP/Helo 属于连接级信息，同一连接可投递多封邮件
+func (s *Session) Reset() {
+	s.From = ""
+	s.To = ""
+}
 func (s *Session) Logout() error {
 	return nil
 }
