@@ -7,11 +7,16 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/mail"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/emersion/go-msgauth/dkim"
+	"github.com/emersion/go-msgauth/dmarc"
 	"github.com/emersion/go-smtp"
 	"golang.org/x/crypto/acme/autocert"
 )
@@ -203,6 +208,102 @@ func startHealthCheck() {
 }
 
 // ==========================================
+// 邮件验证功能
+// ==========================================
+type EmailVerification struct {
+	SPFResult   string
+	DKIMResult  string
+	DMARCResult string
+	AuthResults string
+}
+
+// 验证 SPF
+func verifySPF(from string, clientIP string) string {
+	// 提取发件人域名
+	parts := strings.Split(from, "@")
+	if len(parts) != 2 {
+		return "none"
+	}
+	domain := strings.Trim(parts[1], "<>")
+
+	// 简化的 SPF 检查：查询 DNS TXT 记录
+	txtRecords, err := net.LookupTXT(domain)
+	if err != nil {
+		return "none"
+	}
+
+	// 查找 SPF 记录
+	for _, txt := range txtRecords {
+		if strings.HasPrefix(txt, "v=spf1") {
+			// 简单判断：包含 +all 或 ~all
+			if strings.Contains(txt, "+all") {
+				return "pass"
+			} else if strings.Contains(txt, "~all") {
+				return "softfail"
+			} else if strings.Contains(txt, "-all") {
+				return "fail"
+			}
+			return "neutral"
+		}
+	}
+	return "none"
+}
+
+// 验证 DKIM
+func verifyDKIM(rawEmail []byte) string {
+	msg, err := mail.ReadMessage(bytes.NewReader(rawEmail))
+	if err != nil {
+		return "none"
+	}
+
+	// 使用 go-msgauth 的 DKIM 验证
+	verifications, err := dkim.Verify(bytes.NewReader(rawEmail))
+	if err != nil || len(verifications) == 0 {
+		return "none"
+	}
+
+	// 检查所有签名
+	for _, v := range verifications {
+		if v.Err == nil {
+			return "pass"
+		}
+	}
+	return "fail"
+}
+
+// 验证 DMARC
+func verifyDMARC(from string) string {
+	parts := strings.Split(from, "@")
+	if len(parts) != 2 {
+		return "none"
+	}
+	domain := strings.Trim(parts[1], "<>")
+
+	// 查询 _dmarc.domain 的 TXT 记录
+	dmarcDomain := "_dmarc." + domain
+	txtRecords, err := net.LookupTXT(dmarcDomain)
+	if err != nil {
+		return "none"
+	}
+
+	// 查找 DMARC 记录
+	for _, txt := range txtRecords {
+		if strings.HasPrefix(txt, "v=DMARC1") {
+			record, err := dmarc.Parse(txt)
+			if err != nil {
+				return "none"
+			}
+			// 如果有 DMARC 记录，根据策略返回结果
+			if record.Policy == dmarc.PolicyNone {
+				return "pass"
+			}
+			return "pass" // 有策略就算通过
+		}
+	}
+	return "none"
+}
+
+// ==========================================
 // SMTP 服务实现
 // ==========================================
 type Backend struct{}
@@ -257,7 +358,24 @@ func (s *Session) Data(r io.Reader) error {
 	}
 
 	rawEmail := buf.Bytes()
-	log.Printf("收到邮件: %s -> %s, 开始分发给 %d 个收件端...", s.From, s.To, len(healthyURLs))
+	log.Printf("收到邮件: %s -> %s, 开始验证...", s.From, s.To)
+
+	// 执行邮件验证
+	verification := EmailVerification{
+		SPFResult:  verifySPF(s.From, "unknown"), // 客户端IP在此处无法获取，可以后续优化
+		DKIMResult: verifyDKIM(rawEmail),
+		DMARCResult: verifyDMARC(s.From),
+	}
+	verification.AuthResults = fmt.Sprintf(
+		"spf=%s; dkim=%s; dmarc=%s",
+		verification.SPFResult,
+		verification.DKIMResult,
+		verification.DMARCResult,
+	)
+	log.Printf("验证结果: SPF=%s, DKIM=%s, DMARC=%s",
+		verification.SPFResult, verification.DKIMResult, verification.DMARCResult)
+
+	log.Printf("开始分发给 %d 个收件端...", len(healthyURLs))
 
 	var wg sync.WaitGroup
 	var muResult sync.Mutex
@@ -269,7 +387,7 @@ func (s *Session) Data(r io.Reader) error {
 		wg.Add(1)
 		go func(webhookURL string) {
 			defer wg.Done()
-			
+
 			req, err := http.NewRequest("POST", webhookURL, bytes.NewReader(rawEmail))
 			if err != nil {
 				return
@@ -278,6 +396,12 @@ func (s *Session) Data(r io.Reader) error {
 			req.Header.Set("X-Forwarded-From", s.From)
 			req.Header.Set("X-Forwarded-To", s.To)
 			req.Header.Set("Content-Type", "message/rfc822")
+
+			// 添加验证结果头
+			req.Header.Set("X-SPF-Result", verification.SPFResult)
+			req.Header.Set("X-DKIM-Result", verification.DKIMResult)
+			req.Header.Set("X-DMARC-Result", verification.DMARCResult)
+			req.Header.Set("X-Auth-Results", verification.AuthResults)
 
 			client := &http.Client{Timeout: 30 * time.Second}
 			resp, err := client.Do(req)

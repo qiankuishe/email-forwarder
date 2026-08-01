@@ -3,6 +3,7 @@ module mail-gateway
 go 1.22
 
 require (
+	github.com/emersion/go-msgauth v0.6.8
 	github.com/emersion/go-smtp v0.21.3
 	golang.org/x/crypto v0.26.0
 )
