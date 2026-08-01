@@ -12,8 +12,7 @@ RUN go mod tidy
 COPY . .
 
 # 4. 编译二进制文件
-RUN CGO_ENABLED=0 GOOS=linux go build -o mail-gateway .
-
+RUN rm -f go.sum && go clean -modcache && go mod tidy && CGO_ENABLED=0 GOOS=linux go build -o mail-gateway .
 # 运行镜像
 FROM alpine:latest
 
