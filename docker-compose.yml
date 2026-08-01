@@ -14,3 +14,5 @@ services:
     volumes:
       # 挂载宿主机目录，持久化保存申请下来的 TLS 证书，防止重启频繁申请被拉黑
       - ./certs:/app/certs
+      # 持久化已注册的收件端，否则每次 --build 重建容器都会丢失注册信息
+      - ./endpoints.json:/app/endpoints.json
