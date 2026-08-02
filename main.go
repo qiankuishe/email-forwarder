@@ -266,7 +266,7 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 	mu.RUnlock()
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	
+
 	if healthyCount > 0 {
 		fmt.Fprintf(w, `
 			<html>
@@ -299,9 +299,9 @@ func statusHandler(w http.ResponseWriter, r *http.Request) {
 // 因此鉴权失败(401/403)、方法不允许(404/405)等情况全部被误判为健康。
 //
 // 改为发送一个空的 POST 请求（不带 Content-Length 邮件体），并携带该端点自己的
-// auth_token。真实的收信端点在这种请求下预期返回 400（邮件内容为空）而不是
-// 401/403/404/5xx，说明鉴权和路由都是通的；返回 401/403 说明密钥不匹配；
-// 5xx 或网络错误才视为不健康。
+// auth_token。真实的收信端点在这种请求下预期返回 400（邮件内容为空），说明鉴权和
+// 路由都是通的；401/403 说明密钥不匹配；404/405 说明这个地址上没有收信端点；
+// 5xx 或网络错误说明后端故障——后三类都判为不健康。
 func probeEndpoint(ep *Endpoint) bool {
 	req, err := http.NewRequest("POST", ep.WebhookURL, bytes.NewReader(nil))
 	if err != nil {
@@ -326,6 +326,14 @@ func probeEndpoint(ep *Endpoint) bool {
 	}
 	if resp.StatusCode == 401 || resp.StatusCode == 403 {
 		log.Printf("[%s] 健康检查发现鉴权失败（密钥可能不一致），标记为不健康", ep.WebhookURL)
+		return false
+	}
+	// 404/405 说明这个地址上根本没有收信端点（典型情况：webhook_url 误填成了
+	// 静态前端站点的地址，静态站对 POST 会回 405）。必须判为不健康，
+	// 否则会一直显示"正常"，而邮件全部投进空气里。
+	if resp.StatusCode == 404 || resp.StatusCode == 405 {
+		log.Printf("[%s] 健康检查返回 %d，该地址没有收信端点（webhook_url 可能填错），标记为不健康",
+			ep.WebhookURL, resp.StatusCode)
 		return false
 	}
 	return true
@@ -773,7 +781,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", statusHandler)
 	mux.HandleFunc("/register", registerHandler)     // 供后端主动注册/续约使用
-	mux.HandleFunc("/unregister", unregisterHandler)  // 供后端主动下线 webhook 使用
+	mux.HandleFunc("/unregister", unregisterHandler) // 供后端主动下线 webhook 使用
 
 	httpServer := &http.Server{
 		Addr: ":8088",

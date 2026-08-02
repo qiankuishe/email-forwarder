@@ -102,10 +102,12 @@ curl -X POST http://mx.300031.xyz:8088/unregister \
 - 请求会携带该收件端自己的 `auth_token`，并附带 `X-Health-Check: 1` 头
 - 主项目的 `/api/email/incoming` 在收到空 body 请求时会返回 400（邮件内容为空），
   这在探测中被视为"服务通、鉴权通"，判定为健康
-- 返回 `401`/`403`（密钥不匹配）或 `5xx`/网络错误 才判定为不健康
+- 返回 `401`/`403`（密钥不匹配）、`404`/`405`（该地址上没有收信端点）、`5xx`
+  或网络错误，都判定为不健康
 - 之所以改成 POST 而不是 GET，是因为 `/api/email/incoming` 只注册了 POST 处理器，
-  旧版用 GET 探测时永远拿到 404，而 404 被旧逻辑误判为"健康"，鉴权失败等真实故障
-  反而探测不出来
+  旧版用 GET 探测时永远拿到 404。`404`/`405` 尤其要判为不健康：`webhook_url` 误填成
+  静态前端站点的地址时，静态站对 POST 正是回 405，若当成健康就会一直显示"正常"
+  而邮件全部投进空气里（判定逻辑有 `main_test.go` 逐状态码覆盖）
 
 ## 状态监控
 
@@ -117,6 +119,34 @@ curl -X POST http://mx.300031.xyz:8088/unregister \
 
 为了使邮件服务正常工作，需要配置以下 DNS 记录：
 
+### ⚠️ MX 指向的主机名必须是 DNS-only，不能走 CDN 代理
+
+这是最容易踩的坑。如果域名托管在 Cloudflare，`mx.300031.xyz` 这条 A 记录必须是
+**灰云（DNS only）**。设成橙云（Proxied）后，该主机名解析出的是 Cloudflare 的
+anycast IP，而 Cloudflare **不代理 25 端口**——外部邮件服务器 TCP 能连上（那些端口
+Cloudflare 为别的服务开着），但拿不到 SMTP 的 `220` 问候，投递全部失败。
+
+排查方法，对比两个地址的 banner：
+
+```bash
+# 走主机名（若为橙云会卡住或报 response reading failed）
+curl -v smtp://mx.300031.xyz:25
+
+# 直连服务器真实 IP（应返回 220 ... ESMTP Service Ready）
+curl -v smtp://<服务器公网IP>:25
+```
+
+由此带来一个连带问题：网关的 HTTP 面板只在 8088 跑**纯 HTTP**（没有 TLS，
+`main.go` 里的 autocert 也拿不到证书，因为 ACME HTTP-01 需要 80 端口）。
+如果之前是靠橙云的 443 给面板套 TLS，改灰云后握手通道就断了。推荐拆成两个主机名：
+
+| 主机名 | 代理状态 | 用途 |
+| --- | --- | --- |
+| `mx.<域名>` | 灰云 DNS-only | MX 指向它，收 SMTP 25 |
+| `gw.<域名>` | 橙云 Proxied | 443 反代到 8088，供主项目握手与状态面板 |
+
+主项目后台的「网关地址」填 `gw.<域名>`，不要填 MX 那个主机名。
+
 ### MX 记录
 ```
 @ MX 10 mx.300031.xyz.
@@ -124,7 +154,8 @@ curl -X POST http://mx.300031.xyz:8088/unregister \
 
 ### A 记录
 ```
-mx.300031.xyz. A <服务器公网IP>
+mx.300031.xyz. A <服务器公网IP>      # 必须 DNS-only
+gw.300031.xyz. A <服务器公网IP>      # 可走代理，供 HTTPS 握手
 ```
 
 ### SPF 记录（可选，推荐）
@@ -161,18 +192,31 @@ mx.300031.xyz. A <服务器公网IP>
 ```bash
 git clone <this-repo>
 cd mail
+
+# 依赖已锁定在 go.sum，可直接构建
+go build -o mail-gateway .
+go vet ./...
+go test ./...
+
+# Docker
 docker build -t email-forwarder .
 docker run -d -p 25:25 -p 8088:8088 email-forwarder
 ```
 
-本地没有 Go 环境时，可以直接推送到 `main` 分支或开 PR，由 GitHub Actions 完成
-`go build` 编译校验（见 `.github/workflows/docker-build.yml`）。
+改动依赖后要跑 `go mod tidy` 并把更新后的 `go.mod` / `go.sum` 一起提交。
+Dockerfile 走 `go mod download`，会按 `go.sum` 校验依赖，不再像早期版本那样
+每次构建都 `rm -f go.sum && go mod tidy`（那样等于放弃了校验，还掩盖了
+`go.sum` 本身缺条目/哈希错误导致本地 `go build` 一直失败的问题）。
+
+本地没有 Go 环境时，可以推送分支或开 PR，由 GitHub Actions 跑
+gofmt / vet / test / 镜像构建（见 `.github/workflows/docker-build.yml`）。
 
 ### 目录结构
 
 ```
 .
 ├── main.go              # 主程序
+├── main_test.go         # probeEndpoint 健康判定的回归测试
 ├── go.mod               # Go 模块定义
 ├── go.sum               # 依赖校验和
 ├── Dockerfile           # Docker 构建文件

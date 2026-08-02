@@ -13,8 +13,37 @@ env:
   ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
 
 jobs:
+  # 先跑编译与测试。Docker 构建虽然也会 go build，但拿不到 vet/test 的结果，
+  # 而本项目主要靠 CI 做代码校验（开发机上不一定装了 Go）。
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Verify gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "以下文件未通过 gofmt："
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -v ./...
+
   build:
     runs-on: ubuntu-latest
+    needs: test
 
     steps:
       - name: Checkout code
