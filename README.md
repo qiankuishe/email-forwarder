@@ -19,26 +19,33 @@
 
 ## 快速部署
 
-### 使用 Docker（推荐）
+### 使用 Docker Compose（推荐）
+
+```bash
+docker compose pull      # 拉取 CI 构建的镜像
+docker compose up -d
+docker compose logs -f
+```
+
+`docker-compose.yml` 默认使用 Docker Hub 上由 CI 构建的镜像，并且：
+
+- HTTP 面板只绑 `127.0.0.1:8088`，由反代在走 CDN 的子域上对外提供（见下方 DNS 配置）
+- 证书目录与 `endpoints.json` 都挂载持久化，重建容器不丢注册信息
+- 限制了日志体积
+
+### 使用 docker run
 
 ```bash
 docker run -d \
-  --name email-forwarder \
+  --name mail-gateway \
   -p 25:25 \
-  -p 8088:8088 \
-  -e REQUIRE_REGISTER_AUTH=false \
+  -p 127.0.0.1:8088:8088 \
+  -e REQUIRE_REGISTER_AUTH=true \
+  -e REGISTER_AUTH_TOKEN='<与主项目 EMAIL_WEBHOOK_SECRET 相同的强随机值>' \
   -v $(pwd)/certs:/app/certs \
   -v $(pwd)/endpoints.json:/app/endpoints.json \
   --restart unless-stopped \
   fujiwarashuken/email-forwarder:latest
-```
-
-### 使用 Docker Compose
-
-```bash
-docker-compose up -d
-docker-compose logs -f
-docker-compose down
 ```
 
 ### CI/CD
@@ -146,6 +153,33 @@ curl -v smtp://<服务器公网IP>:25
 | `gw.<域名>` | 橙云 Proxied | 443 反代到 8088，供主项目握手与状态面板 |
 
 主项目后台的「网关地址」填 `gw.<域名>`，不要填 MX 那个主机名。
+
+### TLS 证书
+
+网关的 SMTP STARTTLS 证书必须是**公共可信**的，否则外部 MTA 无法验证。
+不要用 Cloudflare Origin CA 证书——它只被 Cloudflare 边缘信任。
+
+用宿主机的 acme.sh 签发并自动续期（DNS-01，不需要开 80 端口）：
+
+```bash
+acme.sh --issue --dns dns_cf -d mx.example.com --keylength 2048
+
+# 装到 Go 程序读取的路径（certs/<域名>/<域名> 与 <域名>.key），
+# 续期后自动重启容器让新证书生效
+acme.sh --install-cert -d mx.example.com \
+  --fullchain-file /root/email-forwarder/certs/mx.example.com/mx.example.com \
+  --key-file      /root/email-forwarder/certs/mx.example.com/mx.example.com.key \
+  --reloadcmd     "docker restart mail-gateway"
+```
+
+验证外部 MTA 视角下证书是否可信（`Verify return code: 0 (ok)`）：
+
+```bash
+openssl s_client -connect <服务器IP>:25 -starttls smtp -servername mx.example.com
+```
+
+反代（gw 子域）那一侧因为走 CDN 代理，可以继续用 Cloudflare Origin CA 证书——
+有效期长达 15 年，不需要续期维护。
 
 ### MX 记录
 ```

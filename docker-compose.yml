@@ -1,18 +1,38 @@
-version: '3.8'
-
 services:
   mail-gateway:
-    build: .
-    image: mail-gateway:latest
+    # 默认直接使用 CI 构建并推送到 Docker Hub 的镜像，不在服务器上本地 build。
+    # 更新方式：docker compose pull && docker compose up -d
+    # 需要用本地代码构建时，取消下面 build 的注释并改 image 为 mail-gateway:latest。
+    image: fujiwarashuken/email-forwarder:latest
+    # build: .
     container_name: mail-gateway
     restart: unless-stopped
     ports:
-      # 必须映射到主机的 25 端口，否则外部无法投递邮件
+      # 必须映射到主机的 25 端口，否则外部无法投递邮件。
+      # ⚠️ MX 指向的主机名必须是 DNS-only（不走 CDN 代理），
+      # 否则外部 MTA 连到 CDN 的 anycast IP 上拿不到 SMTP banner，收件全断。
       - "25:25"
-      # HTTP 状态面板和注册接口
-      - "8088:8088"
+      # HTTP 面板与 /register 只绑回环地址，对外由反代（如 nginx）在一个
+      # 走 CDN 代理的子域上终结 TLS 后转发过来。
+      # 绑 0.0.0.0 会让 /register 直接暴露公网：在 REQUIRE_REGISTER_AUTH=false
+      # 时任何人都能注册自己的 webhook，把收到的邮件抄走一份。
+      - "127.0.0.1:8088:8088"
+    environment:
+      # 生产环境务必开启注册准入校验，并把 token 换成强随机值。
+      # 注意：主项目握手时用同一个值作为请求头 X-Email-Auth-Token，
+      # 因此这里的值需要与主项目的 EMAIL_WEBHOOK_SECRET 保持一致。
+      REQUIRE_REGISTER_AUTH: "false"
+      REGISTER_AUTH_TOKEN: "ceemail"
     volumes:
-      # 挂载宿主机目录，持久化保存申请下来的 TLS 证书，防止重启频繁申请被拉黑
+      # 持久化 TLS 证书，防止重启频繁申请被 CA 限流。
+      # 证书由宿主机的 acme.sh 签发并 install-cert 到这里，
+      # reloadcmd 设为 `docker restart mail-gateway` 即可在续期后自动生效。
       - ./certs:/app/certs
-      # 持久化已注册的收件端，否则每次 --build 重建容器都会丢失注册信息
+      # 持久化已注册的收件端，否则重建容器会丢失注册信息
       - ./endpoints.json:/app/endpoints.json
+    logging:
+      # 限制日志体积，避免长期运行把磁盘写满
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
