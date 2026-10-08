@@ -826,6 +826,12 @@ func (s *Session) Rcpt(to string, opts *smtp.RcptOptions) error {
 	return nil
 }
 
+func registeredCount() int {
+	mu.RLock()
+	defer mu.RUnlock()
+	return len(endpoints)
+}
+
 func (s *Session) Data(r io.Reader) error {
 	mu.RLock()
 	var healthyEndpoints []Endpoint
@@ -836,7 +842,7 @@ func (s *Session) Data(r io.Reader) error {
 	}
 	mu.RUnlock()
 
-	if len(healthyEndpoints) == 0 {
+	if len(healthyEndpoints) == 0 && !(spoolEnabled() && registeredCount() > 0) {
 		log.Printf("拒绝接收邮件：无健康的收件端")
 		return &smtp.SMTPError{
 			Code:         451,
@@ -887,7 +893,34 @@ func (s *Session) Data(r io.Reader) error {
 	if s.ClientIP != nil {
 		meta.ClientIP = s.ClientIP.String()
 	}
-	results := deliverToEndpoints(rawEmail, meta, s.To, healthyEndpoints)
+	var results map[string]*rcptResult
+	if len(healthyEndpoints) > 0 {
+		results = deliverToEndpoints(rawEmail, meta, s.To, healthyEndpoints)
+	} else {
+		// 只会在开启缓冲且有已注册（但暂时不健康）的端点时走到这里
+		results = make(map[string]*rcptResult, len(s.To))
+		for _, to := range s.To {
+			results[to] = &rcptResult{outcome: outcomeTransient}
+		}
+	}
+	if spoolEnabled() {
+		var pending []string
+		for _, to := range s.To {
+			if results[to].outcome == outcomeTransient {
+				pending = append(pending, to)
+			}
+		}
+		if len(pending) > 0 {
+			if err := spoolMessage(rawEmail, meta, pending); err != nil {
+				log.Printf("⚠️ 写入本地缓冲失败（%v），回 451 由发件方重试", err)
+			} else {
+				log.Printf("主 API 暂不可用，已写入本地缓冲稍后重投: %s -> %v", s.From, pending)
+				for _, to := range pending {
+					results[to].outcome = outcomeAccepted
+				}
+			}
+		}
+	}
 	reply := smtpReplyFor(results)
 	if reply == nil {
 		log.Printf("邮件处理完成: %s -> %v", s.From, s.To)
@@ -911,8 +944,10 @@ func (s *Session) Logout() error {
 // ==========================================
 func main() {
 	loadConfigFromEnv()
+	loadSpoolConfig()
 	loadEndpoints()
 	go startHealthCheck()
+	startSpoolWorker()
 
 	// 证书路径默认沿用旧约定 ./certs/<域名>/<域名>(.key)，可用 TLS_CERT_FILE / TLS_KEY_FILE 覆盖
 	certFile := fmt.Sprintf("./certs/%s/%s", DomainName, DomainName)
