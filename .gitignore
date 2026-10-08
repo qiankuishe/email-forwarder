@@ -1,0 +1,9 @@
+mail-gateway
+mail-proxy
+/endpoints.json
+/certs/
+/spool/
+/data/
+.env
+*.pem
+*.key

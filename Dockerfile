@@ -1,4 +1,6 @@
-FROM golang:1.22-alpine AS builder
+# Go 1.22 已停止维护，标准库（crypto/tls、net/http、net/mail 等）有多个已公开漏洞，
+# 用仍在维护的 1.26 系列构建。
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
@@ -19,7 +21,7 @@ COPY . .
 # 4. 编译二进制文件
 RUN CGO_ENABLED=0 GOOS=linux go build -o mail-gateway .
 # 运行镜像
-FROM alpine:latest
+FROM alpine:3
 
 # 安装证书以支持 TLS 请求
 RUN apk --no-cache add ca-certificates tzdata
