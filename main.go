@@ -13,6 +13,7 @@ import (
 	"net/mail"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -80,8 +81,15 @@ func envBool(name string) (val bool, set bool) {
 	return false, false
 }
 
+// 单封邮件大小上限。默认 25MB，与主 API 的 HARD_MAX_INBOUND_BYTES 一致——
+// 旧值 26MB 时，25~26MB 之间的邮件网关收下、主 API 回 413，结果被当成临时失败反复重投。
+var maxMessageBytes int64 = 25 * 1024 * 1024
+
 // 从环境变量加载配置，覆盖硬编码默认值
 func loadConfigFromEnv() {
+	if v, err := strconv.ParseInt(os.Getenv("MAX_MESSAGE_BYTES"), 10, 64); err == nil && v > 0 {
+		maxMessageBytes = v
+	}
 	tokenSet := false
 	if v := os.Getenv("REGISTER_AUTH_TOKEN"); v != "" {
 		registerToken = v
@@ -790,11 +798,15 @@ func (s *Session) Data(r io.Reader) error {
 		return &smtp.SMTPError{Code: 554, Message: "No valid recipients"}
 	}
 
-	// 限制读取最大 26MB
+	// 大小上限由 go-smtp 的 MaxMessageBytes 在协议层强制（超出时 Read 返回 ErrDataTooLarge，552）。
+	// 旧实现把超限也回成 452（临时失败），发件方会一直重投；而且 CopyN 读满 26MB 时
+	// 会把超出部分静默截断后照常转发。
 	buf := new(bytes.Buffer)
-	_, err := io.CopyN(buf, r, 26*1024*1024)
-	if err != nil && err != io.EOF {
-		return &smtp.SMTPError{Code: 452, Message: "Message too large"}
+	if _, err := io.Copy(buf, r); err != nil {
+		if err == smtp.ErrDataTooLarge {
+			return smtp.ErrDataTooLarge
+		}
+		return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 4, 2}, Message: "Error reading message"}
 	}
 
 	rawEmail := buf.Bytes()
@@ -819,95 +831,18 @@ func (s *Session) Data(r io.Reader) error {
 
 	log.Printf("开始分发给 %d 个收件端 x %d 个收件人...", len(healthyEndpoints), len(s.To))
 
-	type deliveryResult struct {
-		accepted bool
-		notFound bool
+	meta := deliveryMeta{From: s.From, Helo: s.Helo, Verification: verification}
+	if s.ClientIP != nil {
+		meta.ClientIP = s.ClientIP.String()
 	}
-
-	var wg sync.WaitGroup
-	var muResult sync.Mutex
-	// 按收件人记录投递结果，一个收件人的失败不应影响其他收件人的判定
-	results := make(map[string]*deliveryResult, len(s.To))
-	for _, to := range s.To {
-		results[to] = &deliveryResult{notFound: true}
+	results := deliverToEndpoints(rawEmail, meta, s.To, healthyEndpoints)
+	reply := smtpReplyFor(results)
+	if reply == nil {
+		log.Printf("邮件处理完成: %s -> %v", s.From, s.To)
+	} else {
+		log.Printf("邮件处理结果: %s -> %v: %v", s.From, s.To, reply)
 	}
-
-	// 对每个收件人 x 每个健康端点分别投递，
-	// 避免像旧实现那样把多个 RCPT TO 压缩成一个 X-Forwarded-To 而丢信。
-	for _, to := range s.To {
-		for _, ep := range healthyEndpoints {
-			wg.Add(1)
-			go func(webhookURL, authToken, rcptTo string) {
-				defer wg.Done()
-
-				req, err := http.NewRequest("POST", webhookURL, bytes.NewReader(rawEmail))
-				if err != nil {
-					return
-				}
-				req.Header.Set("X-Email-Auth-Token", authToken)
-				req.Header.Set("X-Forwarded-From", s.From)
-				req.Header.Set("X-Forwarded-To", rcptTo)
-				req.Header.Set("Content-Type", "message/rfc822")
-
-				// 添加验证结果头
-				req.Header.Set("X-SPF-Result", verification.SPFResult)
-				req.Header.Set("X-DKIM-Result", verification.DKIMResult)
-				req.Header.Set("X-DMARC-Result", verification.DMARCResult)
-				req.Header.Set("X-Auth-Results", verification.AuthResults)
-
-				resp, err := deliveryClient.Do(req)
-				if err != nil {
-					log.Printf("[%s] 投递给 %s 失败: %v", webhookURL, rcptTo, err)
-					muResult.Lock()
-					results[rcptTo].notFound = false // 网络错误不等于"无此账号"，需要重试
-					muResult.Unlock()
-					return
-				}
-				defer resp.Body.Close()
-
-				muResult.Lock()
-				defer muResult.Unlock()
-
-				res := results[rcptTo]
-				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					res.accepted = true
-					res.notFound = false
-				} else if resp.StatusCode == 404 {
-					// 该后端明确表示找不到该收件人，保留 notFound，交给其他后端判断
-				} else {
-					// 其他 4xx/5xx 错误，不算"无此账号"
-					res.notFound = false
-				}
-			}(ep.WebhookURL, ep.AuthToken, to)
-		}
-	}
-
-	wg.Wait()
-
-	// 逐个收件人判定投递结果，只要有一个收件人成功即可返回成功，
-	// 让 SMTP 客户端认为整体投递成功（细粒度的按收件人拒绝会更复杂，
-	// 目前场景下同一域名的收件人通常落在同一批后端，先满足"不丢信"）。
-	anyAccepted := false
-	allNotFound := true
-	for _, res := range results {
-		if res.accepted {
-			anyAccepted = true
-			allNotFound = false
-		} else if !res.notFound {
-			allNotFound = false
-		}
-	}
-
-	if anyAccepted {
-		log.Printf("邮件成功投递。")
-		return nil
-	} else if allNotFound {
-		log.Printf("所有收件端均无匹配账号: %v", s.To)
-		return &smtp.SMTPError{Code: 550, Message: "User unknown"}
-	}
-
-	log.Printf("邮件分发遭遇错误，要求发件方重试。")
-	return &smtp.SMTPError{Code: 451, Message: "Backend processing error"}
+	return reply
 }
 
 // 只清空信封，ClientIP/Helo 属于连接级信息，同一连接可投递多封邮件
@@ -998,7 +933,7 @@ func main() {
 	s.Domain = DomainName
 	s.ReadTimeout = 60 * time.Second
 	s.WriteTimeout = 60 * time.Second
-	s.MaxMessageBytes = 26 * 1024 * 1024
+	s.MaxMessageBytes = maxMessageBytes
 	s.MaxRecipients = 50
 	s.AllowInsecureAuth = false
 
