@@ -17,7 +17,8 @@ RUN go mod download
 COPY . .
 
 # 4. 编译：去掉本机路径与调试符号
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o mail-gateway .
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o mail-gateway . && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o mail-proxy ./cmd/mail-proxy
 
 # 运行镜像
 FROM alpine:3
@@ -28,17 +29,18 @@ RUN apk --no-cache add ca-certificates tzdata
 WORKDIR /app
 
 # 从构建器中复制二进制文件
-COPY --from=builder /app/mail-gateway .
+COPY --from=builder /app/mail-gateway /app/mail-proxy ./
 
 # 说明：仍以容器内 root 运行，是为了兼容已有部署里宿主机 root 所有的
 # ./endpoints.json 与 ./certs（换成非 root 用户会写不进去，注册信息丢失）。
 # 权限收敛放在 docker-compose.yml：cap_drop ALL、只读根文件系统、no-new-privileges。
 
-# 暴露端口 (25: SMTP, 8088: HTTP 状态面板及注册接口)
-EXPOSE 25 8088
+# 暴露端口 (25: SMTP 收信, 8088: HTTP 状态面板及注册接口;
+#          993/465/587: 可选的 IMAP/SMTP 客户端代理 mail-proxy，默认不启动)
+EXPOSE 25 8088 993 465 587
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD nc -z 127.0.0.1 25 || exit 1
 
-# 运行程序
+# 默认运行收信网关；客户端代理用同一镜像，command 改为 ./mail-proxy（见 docker-compose.yml）
 CMD ["./mail-gateway"]

@@ -56,3 +56,48 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # IMAP/SMTP 客户端代理（可选）。默认不启动；需要时：
+  #   docker compose --profile proxy up -d
+  # 完全无状态：不落盘、不存邮件，所有读写都转发到主项目 HTTP API。
+  # ---------------------------------------------------------------------------
+  mail-proxy:
+    image: ${GATEWAY_IMAGE:-fujiwarashuken/email-forwarder:latest}
+    # build: .
+    profiles: ["proxy"]
+    container_name: mail-proxy
+    command: ["./mail-proxy"]
+    restart: unless-stopped
+    # 同一镜像里自带健康检查探测的是 25 端口，这里改为探测 993
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 993 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    ports:
+      - "993:993" # IMAPS（隐式 TLS）
+      - "465:465" # SMTPS（隐式 TLS，提交发信）
+      - "587:587" # Submission（STARTTLS，提交发信）
+    environment:
+      API_BASE_URL: ${API_BASE_URL:-}  # 必填，未设置时代理启动即退出并提示
+      # 主 API 生产环境的 CSRF 校验要求写请求带 Origin，需为其 FRONTEND_URL 白名单内的一个地址
+      API_ORIGIN: ${API_ORIGIN:-}
+      AUTH_MODE: ${PROXY_AUTH_MODE:-login}
+      PROXY_HOSTNAME: ${PROXY_HOSTNAME:-mail.example.com}
+      TLS_CERT_FILE: /app/certs/proxy/fullchain.pem
+      TLS_KEY_FILE: /app/certs/proxy/key.pem
+      MAX_MESSAGES_PER_FOLDER: ${PROXY_MAX_MESSAGES_PER_FOLDER:-500}
+      IDLE_POLL_SECONDS: ${PROXY_IDLE_POLL_SECONDS:-60}
+    volumes:
+      - ./certs:/app/certs:ro
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

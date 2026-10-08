@@ -1,5 +1,5 @@
-mail-gateway
-mail-proxy
+/mail-gateway
+/mail-proxy
 /endpoints.json
 /certs/
 /spool/
