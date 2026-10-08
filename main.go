@@ -13,6 +13,7 @@ import (
 	"net/mail"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -246,7 +247,17 @@ var (
 // ==========================================
 // 持久化与状态管理
 // ==========================================
+// docker 的单文件 bind mount 在宿主机文件不存在时会建成一个目录，
+// 此时改为把注册表存进该目录里，而不是每次写入都失败。
+func resolveRegistryPath() {
+	if st, err := os.Stat(registryFile); err == nil && st.IsDir() {
+		registryFile = filepath.Join(registryFile, "endpoints.json")
+		log.Printf("⚠️ 注册表路径是目录（宿主机上 endpoints.json 未预先创建），改存到 %s", registryFile)
+	}
+}
+
 func loadEndpoints() {
+	resolveRegistryPath()
 	data, err := os.ReadFile(registryFile)
 	if err != nil {
 		return

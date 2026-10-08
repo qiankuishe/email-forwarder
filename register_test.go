@@ -113,3 +113,14 @@ func TestSaveEndpointsUsesPrivatePermissions(t *testing.T) {
 		t.Errorf("endpoints.json 含投递密钥，权限应为 0600，实际 %v", st.Mode().Perm())
 	}
 }
+
+func TestRegistryPathThatIsADirectory(t *testing.T) {
+	old := registryFile
+	defer func() { registryFile = old }()
+	dir := t.TempDir()
+	registryFile = dir
+	resolveRegistryPath()
+	if registryFile != filepath.Join(dir, "endpoints.json") {
+		t.Errorf("目录路径应改为目录内的 endpoints.json，得到 %s", registryFile)
+	}
+}

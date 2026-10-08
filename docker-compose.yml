@@ -1,9 +1,15 @@
+# 收信网关（默认启动）+ IMAP/SMTP 客户端代理（可选，profile=proxy，默认不启动）。
+#
+# 换一台新 VPS 只需要：git clone → cp .env.example .env 并填值 → 放证书 →
+#   docker compose up -d                       # 只起收信网关
+#   docker compose --profile proxy up -d       # 同时起 IMAP/SMTP 代理
+# 两个服务都不保存邮件或业务数据；网关唯一的本地状态是 endpoints.json（可由主项目重新握手恢复）。
 services:
   mail-gateway:
     # 默认直接使用 CI 构建并推送到 Docker Hub 的镜像，不在服务器上本地 build。
     # 更新方式：docker compose pull && docker compose up -d
     # 需要用本地代码构建时，取消下面 build 的注释并改 image 为 mail-gateway:latest。
-    image: fujiwarashuken/email-forwarder:latest
+    image: ${GATEWAY_IMAGE:-fujiwarashuken/email-forwarder:latest}
     # build: .
     container_name: mail-gateway
     restart: unless-stopped
@@ -14,22 +20,36 @@ services:
       - "25:25"
       # HTTP 面板与 /register 只绑回环地址，对外由反代（如 nginx）在一个
       # 走 CDN 代理的子域上终结 TLS 后转发过来。
-      # 绑 0.0.0.0 会让 /register 直接暴露公网：在 REQUIRE_REGISTER_AUTH=false
-      # 时任何人都能注册自己的 webhook，把收到的邮件抄走一份。
       - "127.0.0.1:8088:8088"
     environment:
-      # 生产环境务必开启注册准入校验，并把 token 换成强随机值。
-      # 注意：主项目握手时用同一个值作为请求头 X-Email-Auth-Token，
-      # 因此这里的值需要与主项目的 EMAIL_WEBHOOK_SECRET 保持一致。
-      REQUIRE_REGISTER_AUTH: "false"
-      REGISTER_AUTH_TOKEN: "ceemail"
+      # 以下变量都从同目录的 .env 读取（见 .env.example）；未设置时取括号里的兼容默认值。
+      # ⚠️ 生产环境务必在 .env 里设置强随机 REGISTER_AUTH_TOKEN 并设 REQUIRE_REGISTER_AUTH=true，
+      #    否则任何能访问 /register 的人都能注册 webhook 抄走所有来信。
+      #    该值要与主项目后台「网关路由」里填写的「网关准入密钥」(registerToken) 一致。
+      REQUIRE_REGISTER_AUTH: ${REQUIRE_REGISTER_AUTH:-false}
+      REGISTER_AUTH_TOKEN: ${REGISTER_AUTH_TOKEN:-ceemail}
+      REGISTER_AUTH_TOKEN_PREVIOUS: ${REGISTER_AUTH_TOKEN_PREVIOUS:-}
+      GATEWAY_DOMAIN: ${GATEWAY_DOMAIN:-mx.300031.xyz}
+      MAX_MESSAGE_BYTES: ${MAX_MESSAGE_BYTES:-26214400}
+      MAX_SMTP_CONNECTIONS: ${MAX_SMTP_CONNECTIONS:-200}
+      MAX_SMTP_CONNECTIONS_PER_IP: ${MAX_SMTP_CONNECTIONS_PER_IP:-20}
+      # 本地重试缓冲默认关闭（VPS 可能随时更换，回 451 让发件方保管更安全），
+      # 需要时在 .env 里设 SPOOL_DIR=/app/data/spool
+      SPOOL_DIR: ${SPOOL_DIR:-}
     volumes:
-      # 持久化 TLS 证书，防止重启频繁申请被 CA 限流。
-      # 证书由宿主机的 acme.sh 签发并 install-cert 到这里，
-      # reloadcmd 设为 `docker restart mail-gateway` 即可在续期后自动生效。
+      # 证书：由宿主机 acme.sh 签发并 install-cert 到这里，续期覆盖后网关自动热加载
       - ./certs:/app/certs
-      # 持久化已注册的收件端，否则重建容器会丢失注册信息
+      # 已注册的收件端（含投递密钥）。⚠️ 首次部署先在宿主机执行 `touch endpoints.json`，
+      # 否则 docker 会把它建成目录（网关会自动兼容，但更清楚的做法是预先建好文件）
       - ./endpoints.json:/app/endpoints.json
+      # 可选的重试缓冲目录
+      - ./data:/app/data
+    # 权限收敛：只保留绑定 25 端口的能力，根文件系统只读
+    cap_drop: [ALL]
+    cap_add: [NET_BIND_SERVICE]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs: ["/tmp"]
     logging:
       # 限制日志体积，避免长期运行把磁盘写满
       driver: json-file
