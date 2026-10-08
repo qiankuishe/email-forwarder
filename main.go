@@ -34,8 +34,8 @@ const (
 	// 可通过环境变量 REGISTER_AUTH_TOKEN 覆盖。
 	DefaultRegisterToken = "ceemail"
 
-	// 绑定的网关域名，用于申请 TLS 证书
-	DomainName = "mx.300031.xyz"
+	// 绑定的网关域名默认值（SMTP 问候域名、证书域名），可用 GATEWAY_DOMAIN 覆盖
+	DefaultDomainName = "mx.300031.xyz"
 
 	// 本地持久化保存已注册收件端的文件名
 	RegistryFile = "endpoints.json"
@@ -85,8 +85,26 @@ func envBool(name string) (val bool, set bool) {
 // 旧值 26MB 时，25~26MB 之间的邮件网关收下、主 API 回 413，结果被当成临时失败反复重投。
 var maxMessageBytes int64 = 25 * 1024 * 1024
 
+// 网关主机名（MX 指向的那个）。换 VPS / 换主机名时只需改环境变量，不必改代码重编译。
+var DomainName = DefaultDomainName
+
+// SMTP 连接上限：总数与单 IP（0 = 不限）
+var maxSMTPConns, maxSMTPConnsPerIP = 200, 20
+
+func envInt(name string, def int) int {
+	if v, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name))); err == nil && v >= 0 {
+		return v
+	}
+	return def
+}
+
 // 从环境变量加载配置，覆盖硬编码默认值
 func loadConfigFromEnv() {
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_DOMAIN")); v != "" {
+		DomainName = strings.ToLower(v)
+	}
+	maxSMTPConns = envInt("MAX_SMTP_CONNECTIONS", maxSMTPConns)
+	maxSMTPConnsPerIP = envInt("MAX_SMTP_CONNECTIONS_PER_IP", maxSMTPConnsPerIP)
 	if v, err := strconv.ParseInt(os.Getenv("MAX_MESSAGE_BYTES"), 10, 64); err == nil && v > 0 {
 		maxMessageBytes = v
 	}
@@ -862,31 +880,41 @@ func main() {
 	loadEndpoints()
 	go startHealthCheck()
 
-	// 尝试加载手动配置的证书
+	// 证书路径默认沿用旧约定 ./certs/<域名>/<域名>(.key)，可用 TLS_CERT_FILE / TLS_KEY_FILE 覆盖
 	certFile := fmt.Sprintf("./certs/%s/%s", DomainName, DomainName)
 	keyFile := fmt.Sprintf("./certs/%s/%s.key", DomainName, DomainName)
+	if v := os.Getenv("TLS_CERT_FILE"); v != "" {
+		certFile = v
+	}
+	if v := os.Getenv("TLS_KEY_FILE"); v != "" {
+		keyFile = v
+	}
 
 	var tlsConfig *tls.Config
+	manualCertPresent := false
 
-	// 检查是否存在手动配置的证书
 	if _, err := os.Stat(certFile); err == nil {
 		if _, err := os.Stat(keyFile); err == nil {
-			log.Printf("发现手动配置的证书文件，使用手动证书")
-			cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+			manualCertPresent = true
+			reloader, err := newCertReloader(certFile, keyFile)
 			if err != nil {
-				log.Fatalf("加载证书失败: %v", err)
+				// 旧实现在这里 log.Fatalf，证书文件一坏容器就无限重启、收信全断。
+				// 改为告警后不提供 STARTTLS（外部 MTA 会退回明文投递），保证仍能收信。
+				log.Printf("❌ 加载证书失败，本次不提供 STARTTLS: %v", err)
+			} else {
+				tlsConfig = &tls.Config{
+					GetCertificate: reloader.GetCertificate,
+					ServerName:     DomainName,
+					MinVersion:     tls.VersionTLS12,
+				}
+				log.Printf("手动证书加载成功（支持热加载）: %s", certFile)
 			}
-			tlsConfig = &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				ServerName:   DomainName,
-			}
-			log.Printf("手动证书加载成功")
 		}
 	}
 
 	// 如果没有手动证书，使用 autocert
 	var certManager *autocert.Manager
-	if tlsConfig == nil {
+	if tlsConfig == nil && !manualCertPresent {
 		log.Printf("未找到手动证书，使用 Let's Encrypt 自动证书")
 		certManager = &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
@@ -937,10 +965,16 @@ func main() {
 	s.MaxRecipients = 50
 	s.AllowInsecureAuth = false
 
-	s.TLSConfig = tlsConfig
+	if tlsConfig != nil {
+		s.TLSConfig = tlsConfig
+	}
 
-	log.Printf("启动 SMTP 服务于 :25，域名: %s", DomainName)
-	if err := s.ListenAndServe(); err != nil {
+	ln, err := net.Listen("tcp", s.Addr)
+	if err != nil {
+		log.Fatalf("SMTP 监听失败: %v", err)
+	}
+	log.Printf("启动 SMTP 服务于 :25，域名: %s，连接上限 总数=%d 单IP=%d", DomainName, maxSMTPConns, maxSMTPConnsPerIP)
+	if err := s.Serve(newLimitedListener(ln, maxSMTPConns, maxSMTPConnsPerIP)); err != nil {
 		log.Fatalf("SMTP 服务失败: %v", err)
 	}
 }

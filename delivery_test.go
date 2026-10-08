@@ -180,3 +180,46 @@ func TestOversizeMessageIsPermanent(t *testing.T) {
 		t.Errorf("超限应回 552，实际 %d", c)
 	}
 }
+
+func TestPerIPConnectionLimit(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := smtp.NewServer(&Backend{})
+	s.Domain = "mx.test"
+	go s.Serve(newLimitedListener(ln, 100, 2))
+	defer s.Close()
+
+	var held []*smtp.Client
+	for i := 0; i < 2; i++ {
+		c, err := smtp.Dial(ln.Addr().String())
+		if err == nil {
+			err = c.Hello("x.test")
+		}
+		if err != nil {
+			t.Fatalf("前两个连接应成功: %v", err)
+		}
+		held = append(held, c)
+	}
+	third, err := smtp.Dial(ln.Addr().String())
+	if err == nil {
+		err = third.Hello("x.test") // 客户端在首个命令时才读取问候语
+		third.Close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "421") {
+		t.Errorf("第三个连接应收到 421，实际 %v", err)
+	}
+	held[0].Close()
+	time.Sleep(50 * time.Millisecond)
+	c, err := smtp.Dial(ln.Addr().String())
+	if err == nil {
+		err = c.Hello("x.test")
+	}
+	if err != nil {
+		t.Errorf("释放后应能再连: %v", err)
+	} else {
+		c.Close()
+	}
+	held[1].Close()
+}
