@@ -28,6 +28,10 @@ type apiClient struct {
 	authMode     string // "login" | "app-password"
 	appLoginPath string
 
+	// proxySecret：与主 API 的 Workers secret PROXY_SHARED_SECRET 相同。非空时每个请求带 X-Proxy-Auth，
+	// 主 API 据此信任 X-Client-IP（真实 IMAP/SMTP 客户端 IP，用于按 IP 限流与「最近使用 IP」）。
+	proxySecret string
+
 	// 登录令牌缓存（只在内存里，进程重启即清空）。
 	// 同一用户的多个 IMAP/SMTP 连接（iPhone 会同时开好几个）共用一个主 API 会话，
 	// 否则每个连接各登录一次：主 API 的 /login 会删除该用户的其他会话，互相踢下线。
@@ -37,7 +41,34 @@ type apiClient struct {
 
 type cachedToken struct {
 	token   string
+	mailbox *apiMailbox
 	expires time.Time
+}
+
+// apiMailbox：用某个邮箱地址（而不是平台账号邮箱）登录时，主 API 返回的单邮箱范围。
+// nil 表示整个账户。
+type apiMailbox struct {
+	ID      string `json:"id"`
+	Address string `json:"address"`
+}
+
+func sameMailbox(a, b *apiMailbox) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.ID == b.ID
+}
+
+type ctxKey int
+
+const clientIPKey ctxKey = 1
+
+// withClientIP 把 IMAP/SMTP 客户端的真实 IP 放进 ctx，请求主 API 时作为 X-Client-IP 转交
+func withClientIP(ctx context.Context, ip string) context.Context {
+	if ip == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, clientIPKey, ip)
 }
 
 var errAuthFailed = errors.New("authentication failed")
@@ -70,14 +101,16 @@ func credKey(user, pass string) string {
 }
 
 // login 用用户名/密码换取主 API 的会话令牌（有缓存）。
-func (c *apiClient) login(ctx context.Context, user, pass string, forceRefresh bool) (string, error) {
+// 缓存键含用户名：同一个应用密码用「平台账号邮箱」和「某个邮箱地址」登录是两个范围不同的会话，互不复用。
+// 返回的 mailbox 非 nil 表示单邮箱登录（只在 app-password 模式下由主 API 返回）。
+func (c *apiClient) login(ctx context.Context, user, pass string, forceRefresh bool) (string, *apiMailbox, error) {
 	key := credKey(user, pass)
 	if !forceRefresh {
 		c.mu.Lock()
 		t, ok := c.tokens[key]
 		c.mu.Unlock()
 		if ok && time.Now().Before(t.expires) {
-			return t.token, nil
+			return t.token, t.mailbox, nil
 		}
 	}
 
@@ -88,26 +121,31 @@ func (c *apiClient) login(ctx context.Context, user, pass string, forceRefresh b
 		body = map[string]string{"email": user, "appPassword": pass}
 	}
 	var out struct {
-		SessionToken string `json:"sessionToken"`
-		Token        string `json:"token"`
+		SessionToken string      `json:"sessionToken"`
+		Token        string      `json:"token"`
+		Mailbox      *apiMailbox `json:"mailbox"`
 	}
 	err := c.doJSON(ctx, "", http.MethodPost, path, body, &out)
 	if err != nil {
 		var ae *apiError
 		if errors.As(err, &ae) && (ae.Status == 401 || ae.Status == 403) {
-			return "", errAuthFailed
+			return "", nil, errAuthFailed
 		}
-		return "", err
+		return "", nil, err
 	}
 	tok := out.SessionToken
 	if tok == "" {
 		tok = out.Token
 	}
 	if tok == "" {
-		return "", errors.New("API 登录响应里没有令牌")
+		return "", nil, errors.New("API 登录响应里没有令牌")
+	}
+	mb := out.Mailbox
+	if c.authMode != "app-password" || (mb != nil && mb.ID == "") {
+		mb = nil
 	}
 	c.mu.Lock()
-	c.tokens[key] = cachedToken{token: tok, expires: time.Now().Add(12 * time.Hour)}
+	c.tokens[key] = cachedToken{token: tok, mailbox: mb, expires: time.Now().Add(12 * time.Hour)}
 	// 顺手清理过期项，避免长时间运行后无限增长
 	for k, v := range c.tokens {
 		if time.Now().After(v.expires) {
@@ -115,7 +153,7 @@ func (c *apiClient) login(ctx context.Context, user, pass string, forceRefresh b
 		}
 	}
 	c.mu.Unlock()
-	return tok, nil
+	return tok, mb, nil
 }
 
 func (c *apiClient) forget(user, pass string) {
@@ -136,6 +174,12 @@ func (c *apiClient) newRequest(ctx context.Context, token, method, path string, 
 		req.Header.Set("Origin", c.origin)
 	}
 	req.Header.Set("User-Agent", "mail-proxy")
+	if c.proxySecret != "" {
+		req.Header.Set("X-Proxy-Auth", c.proxySecret)
+	}
+	if ip, _ := ctx.Value(clientIPKey).(string); ip != "" {
+		req.Header.Set("X-Client-IP", ip)
+	}
 	return req, nil
 }
 

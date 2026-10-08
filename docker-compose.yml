@@ -84,6 +84,8 @@ services:
       # 主 API 生产环境的 CSRF 校验要求写请求带 Origin，需为其 FRONTEND_URL 白名单内的一个地址
       API_ORIGIN: ${API_ORIGIN:-}
       AUTH_MODE: ${PROXY_AUTH_MODE:-login}
+      # 与主 API 的 PROXY_SHARED_SECRET 相同；空则不发送 X-Proxy-Auth / 主 API 不信任 X-Client-IP
+      PROXY_SHARED_SECRET: ${PROXY_SHARED_SECRET:-}
       PROXY_HOSTNAME: ${PROXY_HOSTNAME:-mail.example.com}
       TLS_CERT_FILE: /app/certs/proxy/fullchain.pem
       TLS_KEY_FILE: /app/certs/proxy/key.pem

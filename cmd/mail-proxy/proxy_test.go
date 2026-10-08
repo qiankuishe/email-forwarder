@@ -50,11 +50,14 @@ type mockAPI struct {
 	nextID   uint32
 	tokens   map[string]bool // 有效令牌
 	readOnly map[string]bool
+	accounts []map[string]any
+	loginHdr []http.Header // 每次登录请求的请求头（检查 X-Proxy-Auth / X-Client-IP）
 }
 
 func newMockAPI() *mockAPI {
 	m := &mockAPI{emails: map[uint32]*mockEmail{}, origin: "https://mail.test", nextID: 100,
-		tokens: map[string]bool{}, readOnly: map[string]bool{}}
+		tokens: map[string]bool{}, readOnly: map[string]bool{},
+		accounts: []map[string]any{{"id": "acc1", "name": "me@300031.xyz", "type": "permanent"}}}
 	base := time.Date(2026, 10, 1, 8, 0, 0, 0, time.UTC)
 	m.emails[11] = &mockEmail{id: 11, account: "acc1", subject: "Hello one", sender: "alice@example.org", unread: true, received: base}
 	m.emails[12] = &mockEmail{id: 12, account: "acc1", subject: "Second", sender: "bob@example.org", received: base.Add(time.Hour)}
@@ -91,6 +94,31 @@ func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 生产环境的 CSRF：写请求必须带白名单内的 Origin
 	if r.Method != http.MethodGet && r.Header.Get("Origin") != m.origin {
 		jsonResp(w, 403, map[string]string{"error": "csrf", "code": "CSRF_NO_ORIGIN"})
+		return
+	}
+	if p == "/api/auth/app-password/login" {
+		// 与 api/src/routes/auth.ts 一致：平台账号邮箱 → mailbox=null；名下邮箱地址 → mailbox={id,address}
+		var b map[string]string
+		json.NewDecoder(r.Body).Decode(&b)
+		m.loginHdr = append(m.loginHdr, r.Header.Clone())
+		var mailbox any
+		ok := b["appPassword"] == "abcdefghijklmnop"
+		if ok && !strings.EqualFold(b["email"], "user@example.com") {
+			ok = false
+			for _, a := range m.accounts {
+				if strings.EqualFold(a["name"].(string), b["email"]) {
+					mailbox, ok = map[string]any{"id": a["id"], "address": a["name"]}, true
+				}
+			}
+		}
+		if !ok {
+			jsonResp(w, 401, map[string]string{"error": "邮箱或应用专用密码错误"})
+			return
+		}
+		m.logins++
+		tok := fmt.Sprintf("app-%d", m.logins)
+		m.tokens[tok] = true // 应用会话不踢其他会话
+		jsonResp(w, 200, map[string]any{"sessionToken": tok, "token": tok, "mailbox": mailbox})
 		return
 	}
 	if p == "/api/auth/login" {
@@ -130,12 +158,18 @@ func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonResp(w, 200, map[string]any{"user": map[string]string{"id": "u1"}, "impersonatedBy": imp})
 	case p == "/api/email/accounts":
-		jsonResp(w, 200, map[string]any{"accounts": []map[string]any{{"id": "acc1", "name": "me@300031.xyz", "type": "permanent"}}})
-	case p == "/api/email/emails" || p == "/api/email/accounts/acc1/emails":
-		m.list(w, r)
-	case p == "/api/email/accounts/acc1/sent-emails":
+		jsonResp(w, 200, map[string]any{"accounts": m.accounts})
+	case p == "/api/email/emails":
+		m.list(w, r, "")
+	case strings.HasPrefix(p, "/api/email/accounts/") && strings.HasSuffix(p, "/emails"):
+		m.list(w, r, strings.TrimSuffix(strings.TrimPrefix(p, "/api/email/accounts/"), "/emails"))
+	case strings.HasPrefix(p, "/api/email/accounts/") && strings.HasSuffix(p, "/sent-emails"):
+		acc := strings.TrimSuffix(strings.TrimPrefix(p, "/api/email/accounts/"), "/sent-emails")
 		var out []map[string]any
 		for i, s := range m.sent {
+			if a, _ := s["accountId"].(string); a != "" && a != acc || a == "" && acc != "acc1" {
+				continue
+			}
 			out = append(out, map[string]any{"id": 500 + i, "to": s["to"], "subject": s["subject"], "status": "sent", "sentAt": "2026-10-02T10:00:00.000Z"})
 		}
 		jsonResp(w, 200, map[string]any{"emails": out, "hasMore": false})
@@ -201,7 +235,7 @@ func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // 按 id 倒序分页，游标为上一页最后一个 id（与真实 API 的「时间_id」游标语义等价）
-func (m *mockAPI) list(w http.ResponseWriter, r *http.Request) {
+func (m *mockAPI) list(w http.ResponseWriter, r *http.Request, account string) {
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
 	if limit <= 0 {
@@ -210,6 +244,9 @@ func (m *mockAPI) list(w http.ResponseWriter, r *http.Request) {
 	cursor, _ := strconv.Atoi(q.Get("cursor"))
 	var ids []int
 	for id, e := range m.emails {
+		if account != "" && e.account != account {
+			continue
+		}
 		if (q.Get("filter") == "deleted") != e.deleted {
 			continue
 		}
@@ -274,12 +311,21 @@ func selfSigned(t *testing.T) *tls.Config {
 
 func startFixture(t *testing.T, maxFails int) *fixture {
 	t.Helper()
+	return startFixtureWith(t, maxFails, "login", "", nil)
+}
+
+func startFixtureWith(t *testing.T, maxFails int, authMode, secret string, setup func(*mockAPI)) *fixture {
+	t.Helper()
 	m := newMockAPI()
+	if setup != nil {
+		setup(m)
+	}
 	srv := httptest.NewServer(m)
 	t.Cleanup(srv.Close)
 
 	cfg := &proxyConfig{maxMessages: 500, pollInterval: 200 * time.Millisecond, rawCacheMax: 1 << 20, maxRawBytes: 26 << 20, accountDirs: true}
-	api := newAPIClient(srv.URL, m.origin, "login", "")
+	api := newAPIClient(srv.URL, m.origin, authMode, "/api/auth/app-password/login")
+	api.proxySecret = secret
 	limiter := newLoginLimiter(maxFails, time.Minute)
 	counter := newConnCounter(100, 50)
 
@@ -732,4 +778,186 @@ func TestIMAPIdlePushesNewMail(t *testing.T) {
 	}
 	idle.Close()
 	idle.Wait()
+}
+
+// ---------- 应用专用密码：整个账户 / 单个邮箱 ----------
+
+const testAppPW = "abcdefghijklmnop"
+const testSecret = "0123456789abcdef0123456789abcdef-secret"
+
+// 第二个邮箱 two@300031.xyz：21 在收件箱，22 已删除；两个邮箱各有一封已发送
+func withSecondMailbox(m *mockAPI) {
+	m.accounts = append(m.accounts, map[string]any{"id": "acc2", "name": "two@300031.xyz", "type": "permanent"})
+	base := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	m.emails[21] = &mockEmail{id: 21, account: "acc2", subject: "Second box mail", sender: "eve@example.org", unread: true, received: base}
+	m.emails[22] = &mockEmail{id: 22, account: "acc2", subject: "Second box trash", sender: "eve@example.org", deleted: true, received: base.Add(time.Hour)}
+	m.sent = append(m.sent,
+		map[string]any{"accountId": "acc1", "to": "x@example.net", "subject": "From one", "html": "<p>1</p>"},
+		map[string]any{"accountId": "acc2", "to": "y@example.net", "subject": "From two", "html": "<p>2</p>"})
+}
+
+func listNames(t *testing.T, c *imapclient.Client) map[string]bool {
+	t.Helper()
+	boxes, err := c.List("", "*", nil).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]bool{}
+	for _, b := range boxes {
+		out[b.Mailbox] = true
+	}
+	return out
+}
+
+func TestAppPasswordAccountLoginSeesAllMailboxes(t *testing.T) {
+	f := startFixtureWith(t, 5, "app-password", testSecret, withSecondMailbox)
+	c := dialIMAP(t, f.imapAddr, nil)
+	if err := c.Login("user@example.com", testAppPW).Wait(); err != nil {
+		t.Fatalf("账户登录失败: %v", err)
+	}
+	names := listNames(t, c)
+	for _, want := range []string{"INBOX", "Sent", "Trash", "Accounts/me@300031.xyz", "Accounts/two@300031.xyz"} {
+		if !names[want] {
+			t.Errorf("整个账户登录 LIST 缺少 %s: %v", want, names)
+		}
+	}
+	sel, err := c.Select("INBOX", nil).Wait()
+	if err != nil || sel.NumMessages != 4 {
+		t.Fatalf("账户 INBOX 应合并两个邮箱共 4 封: %v %+v", err, sel)
+	}
+	sel, err = c.Select("Sent", nil).Wait()
+	if err != nil || sel.NumMessages != 2 {
+		t.Fatalf("账户 Sent 应合并两个邮箱共 2 封: %v %+v", err, sel)
+	}
+	// 登录请求带共享密钥与真实客户端 IP
+	f.api.mu.Lock()
+	h := f.api.loginHdr[0]
+	f.api.mu.Unlock()
+	if h.Get("X-Proxy-Auth") != testSecret || h.Get("X-Client-IP") != "127.0.0.1" {
+		t.Errorf("登录请求应带 X-Proxy-Auth 与 X-Client-IP，得到 %q %q", h.Get("X-Proxy-Auth"), h.Get("X-Client-IP"))
+	}
+}
+
+func TestAppPasswordMailboxLoginIsScoped(t *testing.T) {
+	f := startFixtureWith(t, 5, "app-password", testSecret, withSecondMailbox)
+	c := dialIMAP(t, f.imapAddr, nil)
+	if err := c.Login("Two@300031.xyz", testAppPW).Wait(); err != nil {
+		t.Fatalf("单邮箱登录失败: %v", err)
+	}
+	names := listNames(t, c)
+	if len(names) != 3 || !names["INBOX"] || !names["Sent"] || !names["Trash"] {
+		t.Errorf("单邮箱登录只应有 INBOX/Sent/Trash，得到 %v", names)
+	}
+	if _, err := c.Select("Accounts/me@300031.xyz", nil).Wait(); err == nil {
+		t.Error("单邮箱登录不能 SELECT 其他邮箱")
+	}
+	sel, err := c.Select("INBOX", nil).Wait()
+	if err != nil || sel.NumMessages != 1 {
+		t.Fatalf("单邮箱 INBOX 应只有 1 封: %v %+v", err, sel)
+	}
+	msgs, err := c.Fetch(imap.SeqSetNum(1), &imap.FetchOptions{UID: true}).Collect()
+	if err != nil || len(msgs) != 1 || msgs[0].UID != 21 {
+		t.Fatalf("单邮箱 INBOX 应是 UID 21: %v %+v", err, msgs)
+	}
+	if f.api.called("GET /api/email/emails") != 0 {
+		t.Error("单邮箱登录不应请求合并收件箱 /api/email/emails")
+	}
+	// 搜索也只在该邮箱内（"one" 只匹配 acc1 的 Hello one）
+	res, err := c.UIDSearch(&imap.SearchCriteria{Text: []string{"one"}}, nil).Wait()
+	if err != nil || len(res.AllUIDs()) != 0 {
+		t.Errorf("单邮箱 SEARCH 不应命中其他邮箱: %v %v", err, res)
+	}
+	res, err = c.UIDSearch(&imap.SearchCriteria{Text: []string{"box"}}, nil).Wait()
+	if err != nil || len(res.AllUIDs()) != 1 || res.AllUIDs()[0] != 21 {
+		t.Errorf("单邮箱 SEARCH 结果不对: %v %v", err, res)
+	}
+	// 其他邮箱的 UID 即使被客户端点名也不会被删除
+	c.Move(imap.UIDSetNum(11), "Trash").Wait()
+	if f.api.emails[11].deleted || f.api.called("DELETE /api/email/emails/11") != 0 {
+		t.Error("单邮箱登录不能删除其他邮箱的邮件")
+	}
+	if _, err := c.Move(imap.UIDSetNum(21), "Trash").Wait(); err != nil || !f.api.emails[21].deleted {
+		t.Errorf("本邮箱 MOVE 到 Trash 应成功: %v", err)
+	}
+	sel, err = c.Select("Trash", nil).Wait()
+	if err != nil || sel.NumMessages != 2 {
+		t.Fatalf("单邮箱 Trash 应只含本邮箱的 21、22: %v %+v", err, sel)
+	}
+	sel, err = c.Select("Sent", nil).Wait()
+	if err != nil || sel.NumMessages != 1 {
+		t.Fatalf("单邮箱 Sent 应只有本邮箱的 1 封: %v %+v", err, sel)
+	}
+	if f.api.called("GET /api/email/accounts/acc1/") != 0 {
+		t.Error("单邮箱登录不应请求其他邮箱的接口")
+	}
+	ap := c.Append("Accounts/me@300031.xyz", 5, nil)
+	ap.Write([]byte("x\r\n\r\n"))
+	ap.Close()
+	if _, err := ap.Wait(); err == nil {
+		t.Error("单邮箱登录 APPEND 到其他邮箱应失败")
+	}
+}
+
+// 同一个应用密码、不同用户名是两个范围不同的会话，令牌缓存不能串用
+func TestAppPasswordTokenCacheKeyedByUsername(t *testing.T) {
+	f := startFixtureWith(t, 5, "app-password", "", withSecondMailbox)
+	for _, u := range []string{"two@300031.xyz", "user@example.com", "two@300031.xyz", "user@example.com"} {
+		c := dialIMAP(t, f.imapAddr, nil)
+		if err := c.Login(u, testAppPW).Wait(); err != nil {
+			t.Fatal(err)
+		}
+		names := listNames(t, c)
+		if (u == "user@example.com") != names["Accounts/two@300031.xyz"] {
+			t.Errorf("用户名 %s 的范围不对: %v", u, names)
+		}
+	}
+	if n := f.api.called("POST /api/auth/app-password/login"); n != 2 {
+		t.Errorf("两个用户名应各登录主 API 1 次（共 2 次），实际 %d", n)
+	}
+	f.api.mu.Lock()
+	h := f.api.loginHdr[0]
+	f.api.mu.Unlock()
+	if h.Get("X-Proxy-Auth") != "" {
+		t.Error("未配置 PROXY_SHARED_SECRET 时不应发送 X-Proxy-Auth")
+	}
+	c := dialIMAP(t, f.imapAddr, nil)
+	if c.Login("nobody@300031.xyz", testAppPW).Wait() == nil {
+		t.Error("不属于该用户的地址应登录失败")
+	}
+}
+
+func TestSMTPMailboxLoginSenderRestricted(t *testing.T) {
+	f := startFixtureWith(t, 5, "app-password", testSecret, withSecondMailbox)
+	c := smtpClient(t, f.smtpAddr)
+	if err := c.Auth(sasl.NewPlainClient("", "two@300031.xyz", testAppPW)); err != nil {
+		t.Fatalf("单邮箱 SMTP 认证失败: %v", err)
+	}
+	if err := c.Mail("me@300031.xyz", nil); err == nil {
+		t.Fatal("单邮箱登录不能用同账户的其他地址发信")
+	}
+	if err := c.Mail("two@300031.xyz", nil); err != nil {
+		t.Fatal(err)
+	}
+	c.Rcpt("a@example.net", nil)
+	w, err := c.Data()
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(w, "Subject: hi\r\n\r\nhello\r\n")
+	if err := w.Close(); err != nil {
+		t.Fatalf("提交失败: %v", err)
+	}
+	last := f.api.sent[len(f.api.sent)-1]
+	if last["accountId"] != "acc2" {
+		t.Errorf("应以 acc2 发信: %+v", last)
+	}
+
+	// 整个账户登录仍可用任一地址
+	c2 := smtpClient(t, f.smtpAddr)
+	if err := c2.Auth(sasl.NewPlainClient("", "user@example.com", testAppPW)); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.Mail("me@300031.xyz", nil); err != nil {
+		t.Errorf("账户登录应能用 me@300031.xyz 发信: %v", err)
+	}
 }

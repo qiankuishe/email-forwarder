@@ -59,6 +59,7 @@ func envBool(name string, def bool) bool {
 
 type options struct {
 	apiBase, apiOrigin      string
+	proxySecret             string
 	authMode, appLoginPath  string
 	hostname                string
 	certFile, keyFile       string
@@ -77,6 +78,7 @@ func loadOptions() *options {
 	o := &options{
 		apiBase:           env("API_BASE_URL", ""),
 		apiOrigin:         env("API_ORIGIN", ""),
+		proxySecret:       env("PROXY_SHARED_SECRET", ""),
 		authMode:          env("AUTH_MODE", "login"),
 		appLoginPath:      env("APP_LOGIN_PATH", "/api/auth/app-password/login"),
 		hostname:          env("PROXY_HOSTNAME", "localhost"),
@@ -132,6 +134,12 @@ func main() {
 	}
 
 	api := newAPIClient(o.apiBase, o.apiOrigin, o.authMode, o.appLoginPath)
+	api.proxySecret = o.proxySecret
+	if o.proxySecret == "" {
+		log.Printf("未设置 PROXY_SHARED_SECRET：主 API 看到的客户端 IP 都是本机，按 IP 限流与「最近使用 IP」不可用")
+	} else if len(o.proxySecret) < 32 {
+		log.Printf("⚠️ PROXY_SHARED_SECRET 少于 32 个字符，主 API 会忽略它（不信任 X-Client-IP）")
+	}
 	limiter := newLoginLimiter(o.loginMaxFails, o.loginWindow)
 	counter := newConnCounter(o.maxConns, o.maxConnsPerIP)
 

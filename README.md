@@ -179,9 +179,9 @@ acme.sh --install-cert -d mx.300031.xyz \
 
 | 客户端操作 | 代理调用的主 API |
 | --- | --- |
-| 登录 | `POST /api/auth/login`（同一用户多个连接共用一个会话） |
+| 登录 | `POST /api/auth/login`，或 `app-password` 模式下 `POST /api/auth/app-password/login`（同一用户名的多个连接共用一个会话；带 `X-Proxy-Auth` / `X-Client-IP`） |
 | 文件夹 `INBOX`（全部邮箱）/ `Accounts/<地址>` | `GET /api/email/emails`、`GET /api/email/accounts/:id/emails` |
-| `Trash` | `GET /api/email/emails?filter=deleted` |
+| `Trash` | `GET /api/email/emails?filter=deleted`（单邮箱登录：`/api/email/accounts/:id/emails?filter=deleted`） |
 | `Sent` | `GET /api/email/accounts/:id/sent-emails`（逐个邮箱合并） |
 | 读信 | `GET /api/email/emails/:id/raw`（无原文的旧邮件用详情合成） |
 | 已读/未读、旗标 | `POST /api/email/emails/:id/read`、`/star` |
@@ -193,10 +193,29 @@ acme.sh --install-cert -d mx.300031.xyz \
 - 安全：必须配置 TLS；登录失败按**客户端 IP**与用户名限流（主 API 看到的 IP 都是 VPS，不能只靠它）；
   只能用本人名下的邮箱作发件人；管理员「模拟登录」的会话只读，不能改标志、删除或发信。
 
+#### 两种登录方式（`PROXY_AUTH_MODE=app-password`）
+
+密码都是在主项目「设置 → 应用专用密码」生成的同一个应用专用密码，区别只在用户名：
+
+| 用户名 | 看到的内容 |
+| --- | --- |
+| **平台账号邮箱**（网页登录用的邮箱） | 整个账户：`INBOX`（全部邮箱合并）、`Sent`、`Trash`、`Accounts/<地址>`；可用名下任一地址发信 |
+| **某个邮箱地址**（名下、未过期） | 只有这一个邮箱：`INBOX` / `Sent` / `Trash` 只含该邮箱，没有 `Accounts/` 子目录；SMTP 发件人只能是该地址 |
+
+主 API 登录响应里的 `mailbox`（单邮箱时为 `{id, address}`，账户登录为 `null`）决定范围，范围由代理执行。
+同一个应用密码换不同用户名是两个独立的会话（令牌缓存按「用户名 + 密码」区分）。
+
+#### 共享密钥与真实客户端 IP
+
+在 `.env` 设 `PROXY_SHARED_SECRET`（≥ 32 个字符），并在主 API 上设同值的 Workers secret
+（`cd api && npx wrangler secret put PROXY_SHARED_SECRET`；轮换时可写「新,旧」两个值）。
+代理会在请求主 API 时带 `X-Proxy-Auth: <密钥>` 与 `X-Client-IP: <IMAP/SMTP 客户端 IP>`（登录请求必带），
+主 API 据此按真实 IP 限流、记录应用密码的「最近使用 IP」。任一边没配置时代理照常工作，只是主 API 看到的 IP 都是 VPS。
+
 ### 已知限制（需要主 API 配合，已整理为主项目的接口需求文档 imap-api-needs.md）
 
 1. **登录会把网页踢下线**：主 API 的 `/login` 会删除该用户的其他会话。代理已让同一用户的所有连接共用一个会话，
-   但网页登录与代理登录仍会互相顶掉。主 API 提供「应用专用密码」后，把 `.env` 的 `PROXY_AUTH_MODE` 改为 `app-password` 即可。
+   但网页登录与代理登录仍会互相顶掉。主 API 已提供「应用专用密码」：把 `.env` 的 `PROXY_AUTH_MODE` 改为 `app-password` 即可（应用会话不踢网页会话）。
 2. **需要 `API_ORIGIN`**：主 API 生产环境对写请求做 Origin 校验，代理以 `API_ORIGIN` 冒充一个白名单前端地址。
 3. 发信时原始 To/Cc 头不保留（主 API `/send` 只接受单个收件人，代理按收件人逐个发）；不支持 cid 内联图片（作为附件发送）。
 4. Trash 里无法「彻底删除」或「恢复」单封邮件（主 API 无对应接口），按保留天数自动清理。
@@ -210,7 +229,8 @@ acme.sh --install-cert -d mx.300031.xyz \
 API_BASE_URL=https://api.cee.edu.pl
 API_ORIGIN=https://mail.300031.xyz        # 主 API FRONTEND_URL 白名单中的任一地址
 PROXY_HOSTNAME=mail.300031.xyz
-PROXY_AUTH_MODE=login
+PROXY_AUTH_MODE=app-password              # 推荐；login = 用网页登录密码
+PROXY_SHARED_SECRET=<openssl rand -hex 32，与主 API 的同名 secret 相同>
 ```
 
 证书（公共可信，覆盖客户端使用的主机名）放到 `certs/proxy/fullchain.pem` 与 `certs/proxy/key.pem`：
@@ -231,13 +251,14 @@ docker compose --profile proxy up -d
 | `API_ORIGIN` | 空 | 见上 |
 | `AUTH_MODE` | `login` | `login` / `app-password`（compose 中对应 `PROXY_AUTH_MODE`） |
 | `APP_LOGIN_PATH` | `/api/auth/app-password/login` | `app-password` 模式调用的接口 |
+| `PROXY_SHARED_SECRET` | 空 | 与主 API 同名 secret 相同；非空时带 `X-Proxy-Auth` / `X-Client-IP` |
 | `IMAPS_ADDR` / `IMAP_ADDR` / `SMTPS_ADDR` / `SUBMISSION_ADDR` | `:993` / 关 / `:465` / `:587` | 设为空或 `off` 即不监听 |
 | `MAX_MESSAGES_PER_FOLDER` | 500 | 每个文件夹同步的最新邮件数 |
 | `IDLE_POLL_SECONDS` | 60（最小 10） | IDLE 期间轮询主 API 的间隔 |
 | `LOGIN_MAX_FAILS` / `LOGIN_FAIL_WINDOW_MINUTES` | 5 / 15 | 单 IP 失败上限（单用户名为其 2 倍） |
 | `MAX_CONNECTIONS` / `MAX_CONNECTIONS_PER_IP` | 500 / 20 | 连接上限 |
 | `MAX_RECIPIENTS` | 20 | 单封信收件人上限 |
-| `ACCOUNT_FOLDERS` | `true` | 是否为每个邮箱单独列出 `Accounts/<地址>` 文件夹 |
+| `ACCOUNT_FOLDERS` | `true` | 整个账户登录时是否为每个邮箱单独列出 `Accounts/<地址>` 文件夹（单邮箱登录永不列出） |
 
 ### 客户端 DNS 与自动配置
 
@@ -253,8 +274,14 @@ _submission._tcp.300031.xyz.  SRV 0 1 587 mail.300031.xyz.
 ```
 
 - **iPhone**：设置 → 邮件 → 账户 → 添加账户 → 其他 → 添加邮件账户；选 **IMAP**，
-  收件服务器 `mail.300031.xyz`、发件服务器 `mail.300031.xyz`，用户名为**网页登录邮箱**，密码为登录密码
-  （主 API 支持应用专用密码后改用它）。也可以做一个 `.mobileconfig` 描述文件一键安装：
+  收件服务器 `mail.300031.xyz`、发件服务器 `mail.300031.xyz`（两处都要填用户名和密码），密码为**应用专用密码**
+  （`PROXY_AUTH_MODE=login` 时才用网页登录密码）。用户名二选一：
+  - 填**平台账号邮箱** → 整个账户。「电子邮件」栏可以填多个地址、用英文逗号分隔（如 `a@300031.xyz, b@300031.xyz`），
+    之后写信时「发件人」可以在这些地址间切换（只能填自己名下的地址，其它地址发信会被拒绝）；
+  - 填**某个邮箱地址** → 只收发这一个邮箱，「电子邮件」栏填同一个地址。想在 iPhone 上把几个邮箱分开显示，
+    就每个地址各加一个账户（密码都用同一个应用专用密码）。
+
+  也可以做一个 `.mobileconfig` 描述文件一键安装：
   `com.apple.mail.managed` 负载中填 `IncomingMailServerHostName=mail.300031.xyz`、`IncomingMailServerPortNumber=993`、
   `IncomingMailServerUseSSL=true`、`OutgoingMailServerHostName=mail.300031.xyz`、`OutgoingMailServerPortNumber=465`、
   `OutgoingMailServerUseSSL=true`、`OutgoingPasswordSameAsIncomingPassword=true`，**不要把密码写进描述文件**。

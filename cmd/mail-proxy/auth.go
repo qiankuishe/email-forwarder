@@ -16,6 +16,10 @@ type userSession struct {
 	pass     string // 仅用于主 API 令牌失效时重新登录；连接断开即丢弃
 	token    string
 	readOnly bool // 管理员模拟会话：只读，任何写操作都拒绝
+	ip       string
+	// mailbox 非 nil：用户名填的是名下某个邮箱地址，只能看到 / 操作这一个邮箱
+	//（INBOX/Sent/Trash 只含该邮箱，没有 Accounts/ 子目录，SMTP 发件人只能是该地址）
+	mailbox *apiMailbox
 
 	mu       sync.Mutex
 	accounts []apiAccount
@@ -31,7 +35,7 @@ func authenticate(ctx context.Context, api *apiClient, limiter *loginLimiter, re
 		log.Printf("登录被限流: ip=%s user=%s", remoteIP, user)
 		return nil, errRateLimited
 	}
-	tok, err := api.login(ctx, user, pass, false)
+	tok, mb, err := api.login(withClientIP(ctx, remoteIP), user, pass, false)
 	if err != nil {
 		if errors.Is(err, errAuthFailed) {
 			limiter.fail(remoteIP, user)
@@ -41,15 +45,22 @@ func authenticate(ctx context.Context, api *apiClient, limiter *loginLimiter, re
 		}
 		return nil, err
 	}
-	s := &userSession{api: api, user: user, pass: pass, token: tok}
+	s := &userSession{api: api, user: user, pass: pass, token: tok, ip: remoteIP, mailbox: mb}
 	ro, err := s.meCheck(ctx)
 	if err != nil {
 		return nil, err
 	}
 	s.readOnly = ro
 	limiter.success(remoteIP, user)
-	log.Printf("登录成功: ip=%s user=%s readOnly=%v", remoteIP, user, ro)
+	log.Printf("登录成功: ip=%s user=%s readOnly=%v scope=%s", remoteIP, user, ro, s.scopeName())
 	return s, nil
+}
+
+func (s *userSession) scopeName() string {
+	if s.mailbox == nil {
+		return "account"
+	}
+	return "mailbox:" + s.mailbox.Address
 }
 
 func (s *userSession) meCheck(ctx context.Context) (bool, error) {
@@ -67,9 +78,14 @@ func (s *userSession) call(ctx context.Context, f func(token string) error) erro
 	err := f(s.token)
 	var ae *apiError
 	if errors.As(err, &ae) && ae.Status == 401 && s.pass != "" {
-		tok, lerr := s.api.login(ctx, s.user, s.pass, true)
+		tok, mb, lerr := s.api.login(withClientIP(ctx, s.ip), s.user, s.pass, true)
 		if lerr != nil {
 			return lerr
+		}
+		if !sameMailbox(mb, s.mailbox) {
+			// 范围变了（例如该邮箱已删除 / 过期）：不能沿用本连接的范围，让客户端重新登录
+			s.api.forget(s.user, s.pass)
+			return errAuthFailed
 		}
 		s.token = tok
 		return f(tok)
@@ -91,6 +107,19 @@ func (s *userSession) getAccounts(ctx context.Context) ([]apiAccount, error) {
 	})
 	if err != nil {
 		return nil, err
+	}
+	if s.mailbox != nil {
+		// 单邮箱登录：只保留这一个邮箱（已删除 / 过期则为空）
+		var only []apiAccount
+		for _, a := range accs {
+			if a.ID == s.mailbox.ID {
+				only = append(only, a)
+			}
+		}
+		accs = only
+		if accs == nil {
+			accs = []apiAccount{}
+		}
 	}
 	s.accounts, s.accTime = accs, time.Now()
 	return accs, nil

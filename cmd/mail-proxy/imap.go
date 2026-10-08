@@ -190,7 +190,7 @@ func (s *imapSession) folders() ([]*folder, error) {
 		{name: folderSent, kind: kindSent, attrs: []imap.MailboxAttr{imap.MailboxAttrSent}},
 		{name: folderTrash, kind: kindTrash, attrs: []imap.MailboxAttr{imap.MailboxAttrTrash}},
 	}
-	if s.cfg.accountDirs {
+	if s.cfg.accountDirs && s.us.mailbox == nil {
 		c, cancel := ctx()
 		defer cancel()
 		accs, err := s.us.getAccounts(c)
@@ -276,6 +276,10 @@ func (s *imapSession) listFolder(f *folder, limit int) ([]*msgMeta, error) {
 		if seen[u] {
 			return
 		}
+		// 单邮箱登录：兜底过滤掉其他邮箱的邮件（正常情况下已按邮箱请求，不会出现）
+		if mb := s.us.mailbox; mb != nil && !isSent && e.AccountID != "" && e.AccountID != mb.ID {
+			return
+		}
 		seen[u] = true
 		m := &msgMeta{uid: u, seen: !e.Unread, flagged: e.Starred, date: e.ReceivedAt.Time,
 			subject: e.Subject, from: e.SenderEmail, size: e.SizeBytes}
@@ -321,9 +325,9 @@ func (s *imapSession) listFolder(f *folder, limit int) ([]*msgMeta, error) {
 	var err error
 	switch f.kind {
 	case kindInbox:
-		err = pageAll("/api/email/emails", nil, false)
+		err = pageAll(s.mailListPath(), nil, false)
 	case kindTrash:
-		err = pageAll("/api/email/emails", url.Values{"filter": {"deleted"}}, false)
+		err = pageAll(s.mailListPath(), url.Values{"filter": {"deleted"}}, false)
 	case kindAccount:
 		err = pageAll("/api/email/accounts/"+url.PathEscape(f.accountID)+"/emails", nil, false)
 	case kindSent:
@@ -346,6 +350,14 @@ func (s *imapSession) listFolder(f *folder, limit int) ([]*msgMeta, error) {
 		out = out[len(out)-limit:]
 	}
 	return out, nil
+}
+
+// mailListPath：收件箱 / 已删除的列表接口。整个账户用合并列表，单邮箱登录只请求该邮箱
+func (s *imapSession) mailListPath() string {
+	if mb := s.us.mailbox; mb != nil {
+		return "/api/email/accounts/" + url.PathEscape(mb.ID) + "/emails"
+	}
+	return "/api/email/emails"
 }
 
 func (s *imapSession) Select(name string, options *imap.SelectOptions) (*imap.SelectData, error) {
@@ -943,7 +955,7 @@ func (s *imapSession) apiSearch(term string) (map[imap.UID]bool, error) {
 	c, cancel := ctx()
 	defer cancel()
 	out := map[imap.UID]bool{}
-	path := "/api/email/emails"
+	path := s.mailListPath()
 	q := url.Values{"limit": {"100"}, "search": {term}}
 	switch s.sel.f.kind {
 	case kindTrash:
