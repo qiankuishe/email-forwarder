@@ -24,6 +24,7 @@ import (
 	"github.com/emersion/go-msgauth/dmarc"
 	"github.com/emersion/go-smtp"
 	"golang.org/x/crypto/acme/autocert"
+	"golang.org/x/net/publicsuffix"
 )
 
 // ==========================================
@@ -607,22 +608,40 @@ func domainOf(addr string) string {
 
 // 取 RFC5322 From 头的域名。DMARC 判定的是这个域，
 // 而不是信封发件人（MAIL FROM），两者可以不同。
-func headerFromDomain(rawEmail []byte) string {
+// 返回 ok=false 表示 From 头缺失、无法解析或含多个不同域名（RFC 7489 §6.6.1，无法判定）。
+func headerFromDomain(rawEmail []byte) (string, bool) {
 	msg, err := mail.ReadMessage(bytes.NewReader(rawEmail))
 	if err != nil {
-		return ""
+		return "", false
+	}
+	// 多个 From 头是常见的伪造手法：显示的是一个，对齐检查用的是另一个
+	if len(msg.Header["From"]) > 1 {
+		return "", false
 	}
 	list, err := msg.Header.AddressList("From")
 	if err != nil || len(list) == 0 {
-		return ""
+		return "", false
 	}
-	return domainOf(list[0].Address)
+	d := domainOf(list[0].Address)
+	for _, a := range list[1:] {
+		if domainOf(a.Address) != d {
+			return "", false
+		}
+	}
+	return d, d != ""
 }
 
-// DMARC 对齐检查。relaxed 模式下只要组织域一致即可，
-// strict 模式要求完全相同。
-// 注意：这里用「标签边界后缀匹配」近似组织域，没有引入公共后缀表(PSL)，
-// 因此对 example.co.uk 这类多级后缀域名判定偏宽松。
+// 组织域（如 mail.example.co.uk → example.co.uk），基于公共后缀表（PSL）。
+// 旧实现用「标签边界后缀匹配」近似，会把 a.co.uk 与 b.co.uk 判为对齐。
+func orgDomain(d string) string {
+	d = strings.ToLower(strings.TrimSuffix(d, "."))
+	if od, err := publicsuffix.EffectiveTLDPlusOne(d); err == nil {
+		return od
+	}
+	return d
+}
+
+// DMARC 对齐检查。relaxed 模式下组织域相同即可，strict 模式要求完全相同。
 func domainsAligned(authDomain, fromDomain string, strict bool) bool {
 	if authDomain == "" || fromDomain == "" {
 		return false
@@ -635,8 +654,7 @@ func domainsAligned(authDomain, fromDomain string, strict bool) bool {
 	if strict {
 		return false
 	}
-	return strings.HasSuffix(authDomain, "."+fromDomain) ||
-		strings.HasSuffix(fromDomain, "."+authDomain)
+	return orgDomain(authDomain) == orgDomain(fromDomain)
 }
 
 // 真实 SPF 判定：依赖发件方 IP、EHLO 域和信封发件人。
@@ -678,9 +696,10 @@ func verifySPF(clientIP net.IP, helo, mailFrom string) (string, string) {
 }
 
 // DKIM 校验，返回 (结果, 校验通过的签名域列表)
+// 最多校验 5 个签名：每个签名都要一次 DNS 查询，不设上限时一封塞满签名的邮件就能放大 DNS 请求。
 func verifyDKIM(rawEmail []byte) (string, []string) {
-	verifications, err := dkim.Verify(bytes.NewReader(rawEmail))
-	if err != nil {
+	verifications, err := dkim.VerifyWithOptions(bytes.NewReader(rawEmail), &dkim.VerifyOptions{MaxVerifications: 5})
+	if err != nil && err != dkim.ErrTooManySignatures {
 		return "temperror", nil
 	}
 	if len(verifications) == 0 {
@@ -688,39 +707,54 @@ func verifyDKIM(rawEmail []byte) (string, []string) {
 	}
 
 	var passed []string
+	tempFail := false
 	for _, v := range verifications {
 		if v.Err == nil {
 			passed = append(passed, v.Domain)
+		} else if dkim.IsTempFail(v.Err) {
+			tempFail = true
 		}
 	}
 	if len(passed) > 0 {
 		return "pass", passed
 	}
+	if tempFail {
+		return "temperror", nil
+	}
 	return "fail", nil
 }
 
-// 查 DMARC 记录，沿父域回退一级（近似组织域）
-func lookupDMARC(fromDomain string) *dmarc.Record {
+// 查 DMARC 记录：先查 From 域本身，没有则查组织域（RFC 7489 §6.6.3）。
+// DNS 临时故障时返回 tempErr=true，避免把「查不到」误报成「没有策略」。
+func lookupDMARC(fromDomain string) (rec *dmarc.Record, tempErr bool) {
 	candidates := []string{fromDomain}
-	if labels := strings.Split(fromDomain, "."); len(labels) > 2 {
-		candidates = append(candidates, strings.Join(labels[1:], "."))
+	if od := orgDomain(fromDomain); od != fromDomain {
+		candidates = append(candidates, od)
 	}
 	for _, d := range candidates {
-		if rec, err := dmarc.Lookup(d); err == nil && rec != nil {
-			return rec
+		r, err := dmarc.Lookup(d)
+		if err == nil && r != nil {
+			return r, false
+		}
+		if err != nil && dmarc.IsTempFail(err) {
+			return nil, true
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // 真实 DMARC 判定：要求 SPF 或 DKIM 至少一项 pass 且与 From 域对齐
 func verifyDMARC(rawEmail []byte, spfResult, spfDomain, dkimResult string, dkimDomains []string) string {
-	fromDomain := headerFromDomain(rawEmail)
-	if fromDomain == "" {
-		return "none"
+	fromDomain, ok := headerFromDomain(rawEmail)
+	if !ok {
+		// From 缺失/无法解析/多个不同域：无法做对齐判定
+		return "permerror"
 	}
 
-	rec := lookupDMARC(fromDomain)
+	rec, tempErr := lookupDMARC(fromDomain)
+	if tempErr {
+		return "temperror"
+	}
 	if rec == nil {
 		// 没有发布 DMARC 记录，无策略可依
 		return "none"
