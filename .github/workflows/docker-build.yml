@@ -78,7 +78,8 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            type=sha,prefix={{branch}}-
+            # PR 事件里 {{branch}} 为空，会生成非法标签 "-<sha>" 导致构建失败，因此只在 push 时打 sha 标签
+            type=sha,prefix={{branch}}-,enable=${{ github.event_name == 'push' }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
