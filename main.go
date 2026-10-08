@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -10,9 +11,11 @@ import (
 	"net"
 	"net/http"
 	"net/mail"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"blitiri.com.ar/go/spf"
@@ -43,20 +46,161 @@ const (
 // 注册接口的准入密钥，启动时从环境变量加载，兼容旧的硬编码默认值
 var registerToken = DefaultRegisterToken
 
-// 测试阶段默认不校验注册准入密钥，方便调试。
-// 生产环境设置环境变量 REQUIRE_REGISTER_AUTH=true 开启校验。
+// 轮换准入密钥时的旧值（REGISTER_AUTH_TOKEN_PREVIOUS）。
+// 换密钥时先把旧值放这里、新值放 REGISTER_AUTH_TOKEN，等主项目改用新值后再删掉，
+// 期间新旧两把都能通过，握手不会中断。
+var registerTokenPrevious = ""
+
+// 是否校验 /register、/unregister 的准入密钥。
+//
+// 取值规则（兼容旧部署）：
+//   - REQUIRE_REGISTER_AUTH=true/1  → 开启
+//   - REQUIRE_REGISTER_AUTH=false/0 → 显式关闭（旧 docker-compose.yml 就是这样写的，保持原行为，但启动时告警）
+//   - 未设置：若 REGISTER_AUTH_TOKEN 已改成非默认值则自动开启，否则关闭并告警
+//
+// 关闭时任何能访问到 8088（或反代它的 gw 子域）的人都能注册自己的 webhook，
+// 之后每封进来的邮件都会被抄送一份过去。
 var requireRegisterAuth = false
+
+// 是否允许 webhook 指向内网/回环地址（默认不允许，防 SSRF：
+// 否则可以借网关每 15 秒一次的探活去打 VPS 本机或内网服务）。
+var allowPrivateWebhooks = false
+
+// 本地持久化收件端的文件路径，可用 REGISTRY_FILE 覆盖（例如挂载目录 /app/data/endpoints.json）
+var registryFile = RegistryFile
+
+func envBool(name string) (val bool, set bool) {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	switch v {
+	case "true", "1", "yes", "on":
+		return true, true
+	case "false", "0", "no", "off":
+		return false, true
+	}
+	return false, false
+}
 
 // 从环境变量加载配置，覆盖硬编码默认值
 func loadConfigFromEnv() {
+	tokenSet := false
 	if v := os.Getenv("REGISTER_AUTH_TOKEN"); v != "" {
 		registerToken = v
+		tokenSet = v != DefaultRegisterToken
 	}
-	if v := os.Getenv("REQUIRE_REGISTER_AUTH"); v == "true" || v == "1" {
-		requireRegisterAuth = true
+	registerTokenPrevious = os.Getenv("REGISTER_AUTH_TOKEN_PREVIOUS")
+	if v, ok := envBool("REQUIRE_REGISTER_AUTH"); ok {
+		requireRegisterAuth = v
+	} else {
+		requireRegisterAuth = tokenSet
 	}
-	log.Printf("注册准入校验: %v（测试阶段可设 REQUIRE_REGISTER_AUTH=true 开启）", requireRegisterAuth)
+	if v, ok := envBool("ALLOW_PRIVATE_WEBHOOKS"); ok {
+		allowPrivateWebhooks = v
+	}
+	if v := os.Getenv("REGISTRY_FILE"); v != "" {
+		registryFile = v
+	}
+
+	if !requireRegisterAuth {
+		log.Printf("⚠️ 安全警告：注册准入校验已关闭，任何人都能调用 /register 注册 webhook 抄走邮件。" +
+			"生产环境请设置强随机的 REGISTER_AUTH_TOKEN 并设 REQUIRE_REGISTER_AUTH=true")
+	} else if registerToken == DefaultRegisterToken || registerTokenPrevious == DefaultRegisterToken {
+		log.Printf("⚠️ 安全警告：准入密钥仍是公开仓库里的默认值 %q，等同于没有校验，请立即更换", DefaultRegisterToken)
+	}
+	log.Printf("注册准入校验: %v", requireRegisterAuth)
 }
+
+// 恒定时间比较准入密钥，支持新旧两把并行
+func registerAuthorized(r *http.Request) bool {
+	if !requireRegisterAuth {
+		return true
+	}
+	got := r.Header.Get("X-Email-Auth-Token")
+	if got == "" {
+		return false
+	}
+	ok := subtle.ConstantTimeCompare([]byte(got), []byte(registerToken)) == 1
+	if registerTokenPrevious != "" &&
+		subtle.ConstantTimeCompare([]byte(got), []byte(registerTokenPrevious)) == 1 {
+		ok = true
+	}
+	return ok
+}
+
+// 校验 webhook_url：只允许 http/https、长度有限、带主机名。
+// 内网地址的拦截放在出站拨号时做（见 safeDialContext），以防 DNS 重绑定绕过。
+func validateWebhookURL(raw string) error {
+	if len(raw) > 2048 {
+		return fmt.Errorf("webhook_url 过长")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("webhook_url 格式错误")
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return fmt.Errorf("webhook_url 只允许 http/https")
+	}
+	if u.Hostname() == "" || u.User != nil {
+		return fmt.Errorf("webhook_url 缺少主机名或含有用户信息")
+	}
+	if !allowPrivateWebhooks {
+		if ip := net.ParseIP(u.Hostname()); ip != nil && isPrivateIP(ip) {
+			return fmt.Errorf("webhook_url 指向内网地址（如确有需要设 ALLOW_PRIVATE_WEBHOOKS=true）")
+		}
+		if strings.EqualFold(u.Hostname(), "localhost") {
+			return fmt.Errorf("webhook_url 指向本机（如确有需要设 ALLOW_PRIVATE_WEBHOOKS=true）")
+		}
+	}
+	return nil
+}
+
+func isPrivateIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() ||
+		ip.IsInterfaceLocalMulticast() ||
+		// 100.64.0.0/10 运营商级 NAT，常见于云厂商内网
+		(ip.To4() != nil && ip.To4()[0] == 100 && ip.To4()[1]&0xC0 == 64)
+}
+
+// 出站拨号时再检查一次真实连接的 IP，防止域名解析到内网（含 DNS 重绑定）
+func safeControl(network, address string, _ syscall.RawConn) error {
+	if allowPrivateWebhooks {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	if ip := net.ParseIP(host); ip != nil && isPrivateIP(ip) {
+		return fmt.Errorf("拒绝连接内网地址 %s（ALLOW_PRIVATE_WEBHOOKS=false）", host)
+	}
+	return nil
+}
+
+// 所有发往 webhook 的请求共用一个客户端：复用连接，并统一做内网拦截
+func newWebhookClient(timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, Control: safeControl}
+	tr := &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          50,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	return &http.Client{
+		Timeout:   timeout,
+		Transport: tr,
+		// 不跟随重定向：webhook 被 30x 到别处（甚至内网）时直接视为失败
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
+var (
+	probeClient    = newWebhookClient(5 * time.Second)
+	deliveryClient = newWebhookClient(60 * time.Second)
+)
 
 // 注册的收件端。每个 webhook 拥有独立的转发密钥（由主项目在握手时传入），
 // 转发邮件时使用这个密钥而不是网关自身的注册密钥，实现"每端点独立密钥"。
@@ -76,7 +220,7 @@ var (
 // 持久化与状态管理
 // ==========================================
 func loadEndpoints() {
-	data, err := os.ReadFile(RegistryFile)
+	data, err := os.ReadFile(registryFile)
 	if err != nil {
 		return
 	}
@@ -121,8 +265,33 @@ func saveEndpoints() {
 	}
 	mu.RUnlock()
 
-	data, _ := json.MarshalIndent(snapshot, "", "  ")
-	os.WriteFile(RegistryFile, data, 0644)
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		log.Printf("❌ 序列化收件端失败: %v", err)
+		return
+	}
+	if err := writeFileAtomic(registryFile, data, 0600); err != nil {
+		// 以前这里的错误被直接丢弃：bind mount 的 endpoints.json 不存在时 Docker 会建成目录，
+		// 写入一直失败而无人知晓，重启后注册信息全丢。
+		log.Printf("❌ 保存收件端到 %s 失败（重启后需重新握手）: %v", registryFile, err)
+	}
+}
+
+// 先写临时文件再改名，避免写到一半崩溃留下损坏的 JSON。
+// 单文件 bind mount 时改名会失败（EBUSY/EXDEV），退回直接覆盖写。
+// 文件里有各收件端的投递密钥，权限收紧为 0600。
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err == nil {
+		if err := os.Rename(tmp, path); err == nil {
+			return nil
+		}
+		os.Remove(tmp)
+	}
+	if err := os.WriteFile(path, data, perm); err != nil {
+		return err
+	}
+	return os.Chmod(path, perm)
 }
 
 // 清理长期未续约的收件端，避免 endpoints.json 无限增长
@@ -164,20 +333,27 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if requireRegisterAuth {
-		token := r.Header.Get("X-Email-Auth-Token")
-		if token != registerToken {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
+	if !registerAuthorized(r) {
+		log.Printf("拒绝未授权的注册请求（来源 %s）", clientAddr(r))
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
 	}
 
 	var req struct {
 		WebhookURL string `json:"webhook_url"`
 		AuthToken  string `json:"auth_token"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.WebhookURL == "" {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+	if err := validateWebhookURL(req.WebhookURL); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(req.AuthToken) > 1024 {
+		http.Error(w, "auth_token too long", http.StatusBadRequest)
 		return
 	}
 
@@ -200,7 +376,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 	if existed {
 		log.Printf("收件端重新握手（幂等更新密钥）: %s", req.WebhookURL)
 	} else {
-		log.Printf("注册了新的收件端: %s", req.WebhookURL)
+		log.Printf("注册了新的收件端: %s（来源 %s）", req.WebhookURL, clientAddr(r))
 	}
 
 	saveEndpoints()
@@ -217,17 +393,16 @@ func unregisterHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if requireRegisterAuth {
-		token := r.Header.Get("X-Email-Auth-Token")
-		if token != registerToken {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
+	if !registerAuthorized(r) {
+		log.Printf("拒绝未授权的注销请求（来源 %s）", clientAddr(r))
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
 	}
 
 	var req struct {
 		WebhookURL string `json:"webhook_url"`
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.WebhookURL == "" {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
@@ -245,6 +420,17 @@ func unregisterHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"removed": existed})
+}
+
+// 请求来源（经反代时取 X-Forwarded-For 第一个），仅用于审计日志
+func clientAddr(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		return strings.TrimSpace(strings.Split(xff, ",")[0]) + " via " + r.RemoteAddr
+	}
+	if ip := r.Header.Get("CF-Connecting-IP"); ip != "" {
+		return ip + " via " + r.RemoteAddr
+	}
+	return r.RemoteAddr
 }
 
 // 状态面板 (GET /)
@@ -312,8 +498,7 @@ func probeEndpoint(ep *Endpoint) bool {
 	req.Header.Set("X-Health-Check", "1")
 	req.Header.Set("Content-Type", "message/rfc822")
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := probeClient.Do(req)
 	if err != nil {
 		return false
 	}
@@ -670,8 +855,7 @@ func (s *Session) Data(r io.Reader) error {
 				req.Header.Set("X-DMARC-Result", verification.DMARCResult)
 				req.Header.Set("X-Auth-Results", verification.AuthResults)
 
-				client := &http.Client{Timeout: 30 * time.Second}
-				resp, err := client.Do(req)
+				resp, err := deliveryClient.Do(req)
 				if err != nil {
 					log.Printf("[%s] 投递给 %s 失败: %v", webhookURL, rcptTo, err)
 					muResult.Lock()
@@ -785,6 +969,12 @@ func main() {
 
 	httpServer := &http.Server{
 		Addr: ":8088",
+		// 没有超时的话，慢速连接（slowloris）可以一直占着连接不放
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    32 * 1024,
 	}
 
 	// 如果使用 autocert，HTTP 服务器需要处理证书验证
