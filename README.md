@@ -182,11 +182,11 @@ acme.sh --install-cert -d mx.300031.xyz \
 | 登录 | `POST /api/auth/login`，或 `app-password` 模式下 `POST /api/auth/app-password/login`（同一用户名的多个连接共用一个会话；带 `X-Proxy-Auth` / `X-Client-IP`） |
 | 文件夹 `INBOX`（全部邮箱）/ `Accounts/<地址>` | `GET /api/email/emails`、`GET /api/email/accounts/:id/emails` |
 | `Trash` | `GET /api/email/emails?filter=deleted`（单邮箱登录：`/api/email/accounts/:id/emails?filter=deleted`） |
-| `Sent` | `GET /api/email/accounts/:id/sent-emails`（逐个邮箱合并） |
+| `Sent` | `GET /api/email/sent-emails?cursor=&limit=`（所有邮箱合并分页；单邮箱登录带 `&accountId=`） |
 | 读信 | `GET /api/email/emails/:id/raw`（无原文的旧邮件用详情合成） |
 | 已读/未读、旗标 | `POST /api/email/emails/:id/read`、`/star` |
 | 删除（移到废纸篓 / `\Deleted`+EXPUNGE） | `DELETE /api/email/emails/:id`（软删除，进 Trash） |
-| 发信（465/587） | `POST /api/email/upload-attachment` + 每个收件人一次 `POST /api/email/send` |
+| 发信（465/587） | `POST /api/email/upload-attachment` + 整封信一次 `POST /api/email/send`（`to`/`cc` 取自信头，信封里其余收件人作 `bcc`；转交 `inReplyTo`/`references`） |
 
 - UID 就是主 API 的邮件 id（自增、稳定），代理不维护任何映射表，换 VPS 后客户端缓存仍然有效。
 - 新邮件：客户端 IDLE 时每 `IDLE_POLL_SECONDS`（默认 60）秒轮询一次主 API 并推送。
@@ -217,7 +217,10 @@ acme.sh --install-cert -d mx.300031.xyz \
 1. **登录会把网页踢下线**：主 API 的 `/login` 会删除该用户的其他会话。代理已让同一用户的所有连接共用一个会话，
    但网页登录与代理登录仍会互相顶掉。主 API 已提供「应用专用密码」：把 `.env` 的 `PROXY_AUTH_MODE` 改为 `app-password` 即可（应用会话不踢网页会话）。
 2. **需要 `API_ORIGIN`**：主 API 生产环境对写请求做 Origin 校验，代理以 `API_ORIGIN` 冒充一个白名单前端地址。
-3. 发信时原始 To/Cc 头不保留（主 API `/send` 只接受单个收件人，代理按收件人逐个发）；不支持 cid 内联图片（作为附件发送）。
+3. 发信：整封信只调用一次 `/send`，要么整封成功、要么整封失败（不会部分重发）。实际投递只按信封收件人：
+   信头 To/Cc 里有、信封里没有的地址不发；信封里不在 To/Cc 的地址作为密送（不进信头）；全是密送时 To 填发件人自己（发件人会收到一份副本）。
+   收件人在信头里只保留地址、不保留显示名；地址格式不合法在 `RCPT TO` 阶段回 `553`；主 API 返回 429（每日 / 每小时 / 新用户配额）时整封回 `452`。
+   不支持 cid 内联图片（作为附件发送）。
 4. Trash 里无法「彻底删除」或「恢复」单封邮件（主 API 无对应接口），按保留天数自动清理。
 5. 每个文件夹只同步最新 `MAX_MESSAGES_PER_FOLDER`（默认 500）封；列表首次同步需逐封下载原文以取得大小与信头。
 
@@ -257,7 +260,7 @@ docker compose --profile proxy up -d
 | `IDLE_POLL_SECONDS` | 60（最小 10） | IDLE 期间轮询主 API 的间隔 |
 | `LOGIN_MAX_FAILS` / `LOGIN_FAIL_WINDOW_MINUTES` | 5 / 15 | 单 IP 失败上限（单用户名为其 2 倍） |
 | `MAX_CONNECTIONS` / `MAX_CONNECTIONS_PER_IP` | 500 / 20 | 连接上限 |
-| `MAX_RECIPIENTS` | 20 | 单封信收件人上限 |
+| `MAX_RECIPIENTS` | 20 | 单封信收件人上限（不能超过主 API 的 100，超过按 100 处理；主 API 后台 `outbound.limits.maxRecipients` 默认 50，也会拦截） |
 | `ACCOUNT_FOLDERS` | `true` | 整个账户登录时是否为每个邮箱单独列出 `Accounts/<地址>` 文件夹（单邮箱登录永不列出） |
 
 ### 客户端 DNS 与自动配置

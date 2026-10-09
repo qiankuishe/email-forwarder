@@ -106,6 +106,14 @@ func loadOptions() *options {
 	if o.proxy.pollInterval < 10*time.Second {
 		o.proxy.pollInterval = 10 * time.Second
 	}
+	// 主 API /send 的 to / cc / bcc 每项最多 100 个地址（审查 M10）：超过的话整封会被 400 退回
+	if o.maxRcpts > apiMaxRecipients {
+		log.Printf("⚠️ MAX_RECIPIENTS=%d 超过主 API 上限，按 %d 处理", o.maxRcpts, apiMaxRecipients)
+		o.maxRcpts = apiMaxRecipients
+	}
+	if o.maxRcpts < 1 {
+		o.maxRcpts = 1
+	}
 	return o
 }
 

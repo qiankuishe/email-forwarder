@@ -273,8 +273,10 @@ type apiEmailSummary struct {
 	Starred     bool     `json:"starred"`
 	ReceivedAt  flexTime `json:"receivedAt"`
 	// 已发送列表的字段
-	To     string   `json:"to"`
-	SentAt flexTime `json:"sentAt"`
+	To          string   `json:"to"`
+	SentAt      flexTime `json:"sentAt"`
+	CreatedAt   flexTime `json:"createdAt"`
+	FromAddress string   `json:"fromAddress"` // /api/email/sent-emails 每行的发件邮箱地址
 	// 若主 API 将来在列表里返回原文大小（见 imap-api-needs.md），可避免为 RFC822.SIZE 下载原文
 	SizeBytes int64 `json:"sizeBytes"`
 }
@@ -419,9 +421,16 @@ func (c *apiClient) uploadAttachment(ctx context.Context, token, filename, conte
 	return &out, nil
 }
 
+// sendRequest 对应主 API POST /api/email/send（审查 2026-10-09 M10 之后的版本）：
+// to / cc / bcc 是地址数组（每项最多 100 个）；bcc 只进信封，主 API 不会把它写进信头；
+// inReplyTo（1 个 <id>）/ references（最多 50 个 <id>，空格分隔）不能含换行。
 type sendRequest struct {
 	AccountID   string               `json:"accountId"`
-	To          string               `json:"to"`
+	To          []string             `json:"to"`
+	Cc          []string             `json:"cc,omitempty"`
+	Bcc         []string             `json:"bcc,omitempty"`
+	InReplyTo   string               `json:"inReplyTo,omitempty"`
+	References  string               `json:"references,omitempty"`
 	Subject     string               `json:"subject"`
 	HTML        string               `json:"html"`
 	Attachments []uploadedAttachment `json:"attachments,omitempty"`

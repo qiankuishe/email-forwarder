@@ -76,6 +76,7 @@ type msgMeta struct {
 	date    time.Time
 	subject string
 	from    string // 发件人（已发送文件夹为收件人）
+	sender  string // 仅已发送：发件邮箱地址（/api/email/sent-emails 的 fromAddress）
 	size    int64
 }
 
@@ -287,7 +288,10 @@ func (s *imapSession) listFolder(f *folder, limit int) ([]*msgMeta, error) {
 			m.from = e.Sender + " " + e.SenderEmail
 		}
 		if isSent {
-			m.seen, m.date, m.from = true, e.SentAt.Time, e.To
+			m.seen, m.date, m.from, m.sender = true, e.SentAt.Time, e.To, e.FromAddress
+			if m.date.IsZero() {
+				m.date = e.CreatedAt.Time // 排队中 / 失败的发信没有 sentAt
+			}
 		}
 		out = append(out, m)
 	}
@@ -331,16 +335,13 @@ func (s *imapSession) listFolder(f *folder, limit int) ([]*msgMeta, error) {
 	case kindAccount:
 		err = pageAll("/api/email/accounts/"+url.PathEscape(f.accountID)+"/emails", nil, false)
 	case kindSent:
-		// 主 API 只有按邮箱列出已发送的接口，逐个邮箱合并
-		accs, aerr := s.us.getAccounts(c)
-		if aerr != nil {
-			return nil, aerr
+		// 合并接口一次分页拉所有邮箱的发信（审查 M9：原来逐个邮箱 pageAll，前面的邮箱会占满 limit 额度）。
+		// 单邮箱登录带 accountId，只列该邮箱的。
+		var q url.Values
+		if mb := s.us.mailbox; mb != nil {
+			q = url.Values{"accountId": {mb.ID}}
 		}
-		for _, a := range accs {
-			if err = pageAll("/api/email/accounts/"+url.PathEscape(a.ID)+"/sent-emails", nil, true); err != nil {
-				break
-			}
-		}
+		err = pageAll("/api/email/sent-emails", q, true)
 	}
 	if err != nil {
 		return nil, err
@@ -642,7 +643,11 @@ func (s *imapSession) getRaw(m *msgMeta) ([]byte, error) {
 		})
 		if err == nil {
 			to := d.To
-			raw = buildMIME(s.fromForSent(c), to, strOr(d.Cc), d.Subject, d.SentAt.Time,
+			from := m.sender
+			if from == "" {
+				from = s.fromForSent(c)
+			}
+			raw = buildMIME(from, to, strOr(d.Cc), d.Subject, d.SentAt.Time,
 				fmt.Sprintf("<sent-%d@mail-proxy>", d.ID), strOr(d.TextContent), strOr(d.HTMLContent))
 		}
 	} else {

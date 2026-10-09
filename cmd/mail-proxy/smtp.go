@@ -7,10 +7,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
+	"regexp"
 	"strings"
 	"time"
 
@@ -105,15 +105,66 @@ func (s *submissionSession) Mail(from string, opts *smtp.MailOptions) error {
 	return &smtp.SMTPError{Code: 553, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "Sender address not owned by authenticated user"}
 }
 
+// apiMaxRecipients：主 API /send 的 to / cc / bcc 每项最多 100 个地址；代理的 MAX_RECIPIENTS 不得超过它
+const apiMaxRecipients = 100
+
+// 与主 API 的 z.string().email()（zod 4）同一套规则，格式不合法的地址在 RCPT 阶段就拒绝，
+// 否则整封信到 /send 才会被 400 退回。
+var rcptRe = regexp.MustCompile(`^[A-Za-z0-9_'+\-.]*[A-Za-z0-9_+-]@([A-Za-z0-9][A-Za-z0-9\-]*\.)+[A-Za-z]{2,}$`)
+
+func validRcpt(addr string) bool {
+	return len(addr) <= 320 && !strings.HasPrefix(addr, ".") && !strings.Contains(addr, "..") && rcptRe.MatchString(addr)
+}
+
 func (s *submissionSession) Rcpt(to string, opts *smtp.RcptOptions) error {
 	if s.accountID == "" {
 		return &smtp.SMTPError{Code: 503, EnhancedCode: smtp.EnhancedCode{5, 5, 1}, Message: "MAIL first"}
 	}
+	addr := strings.Trim(to, "<> ")
+	if !validRcpt(addr) {
+		return &smtp.SMTPError{Code: 553, EnhancedCode: smtp.EnhancedCode{5, 1, 3}, Message: "Bad recipient address syntax"}
+	}
+	for _, r := range s.rcpts {
+		if strings.EqualFold(r, addr) {
+			return nil // 重复的 RCPT 不重复计数
+		}
+	}
 	if len(s.rcpts) >= s.b.maxRcpts {
 		return &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 5, 3}, Message: "Too many recipients"}
 	}
-	s.rcpts = append(s.rcpts, strings.Trim(to, "<> "))
+	s.rcpts = append(s.rcpts, addr)
 	return nil
+}
+
+// splitRecipients 按信封决定 to / cc / bcc：
+//   - 信封是实际投递的唯一依据：信头里有、信封里没有的地址不发（有的客户端把密送拆成单独一次提交，
+//     那次的信头仍是原来的 To/Cc；若按信头发，To/Cc 里的人会收到第二封）。
+//   - 信封里的地址出现在信头 To / Cc 中的，保持 To / Cc；其余全部作为 bcc（不会出现在信头里）。
+//   - 主 API 要求 to 非空：全是密送时（典型的 undisclosed-recipients），To 填发件人自己，
+//     发件人会收到一份副本，收件人只看到 To: 发件人，不会互相看到。
+func splitRecipients(from string, rcpts, hdrTo, hdrCc []string) (to, cc, bcc []string) {
+	in := func(list []string, a string) bool {
+		for _, x := range list {
+			if strings.EqualFold(x, a) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, r := range rcpts {
+		switch {
+		case in(hdrTo, r):
+			to = append(to, r)
+		case in(hdrCc, r):
+			cc = append(cc, r)
+		default:
+			bcc = append(bcc, r)
+		}
+	}
+	if len(to) == 0 {
+		to = []string{from}
+	}
+	return to, cc, bcc
 }
 
 func (s *submissionSession) Data(r io.Reader) error {
@@ -151,43 +202,34 @@ func (s *submissionSession) Data(r io.Reader) error {
 		atts = append(atts, *up)
 	}
 
-	// 主 API 的 /send 只接受单个收件人：逐个调用。抄送/密送收件人同样各发一封
-	//（收件人看到的 To 是自己，原始 To/Cc 头不会保留，见 imap-api-needs.md）。
-	var sent, failed []string
-	var lastErr error
-	for _, rcpt := range s.rcpts {
-		req := &sendRequest{AccountID: s.accountID, To: rcpt, Subject: msg.Subject, HTML: msg.HTML, Attachments: atts}
-		err := s.us.call(c, func(tok string) error { return s.b.api.send(c, tok, req) })
-		if err != nil {
-			log.Printf("发信失败 user=%s from=%s to=%s: %v", s.us.user, s.from, rcpt, err)
-			failed = append(failed, rcpt)
-			lastErr = err
-			continue
-		}
-		sent = append(sent, rcpt)
+	// 整封信只调用一次 /send（审查 M10）：要么整封成功，要么整封失败，客户端重发不会让部分收件人收到两封。
+	to, cc, bcc := splitRecipients(s.from, s.rcpts, msg.To, msg.Cc)
+	req := &sendRequest{AccountID: s.accountID, To: to, Cc: cc, Bcc: bcc,
+		InReplyTo: msg.InReplyTo, References: msg.References,
+		Subject: msg.Subject, HTML: msg.HTML, Attachments: atts}
+	if err := s.us.call(c, func(tok string) error { return s.b.api.send(c, tok, req) }); err != nil {
+		log.Printf("发信失败 user=%s from=%s rcpts=%d: %v", s.us.user, s.from, len(s.rcpts), err)
+		return smtpErrFromAPI(err)
 	}
-	log.Printf("SMTP 提交 user=%s from=%s 成功=%v 失败=%v", s.us.user, s.from, sent, failed)
-	if len(failed) == 0 {
-		return nil
-	}
-	if len(sent) == 0 {
-		return smtpErrFromAPI(lastErr)
-	}
-	// 部分成功：不能回临时失败（客户端重发会让已成功的收件人收到重复邮件），回永久失败并列出失败的收件人
-	return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 5, 0},
-		Message: fmt.Sprintf("Delivered to %s; failed for %s", strings.Join(sent, ","), strings.Join(failed, ","))}
+	log.Printf("SMTP 提交 user=%s from=%s to=%d cc=%d bcc=%d", s.us.user, s.from, len(to), len(cc), len(bcc))
+	return nil
 }
 
 func smtpErrFromAPI(err error) error {
 	var ae *apiError
 	if errors.As(err, &ae) {
 		switch {
-		case ae.Code == "DAILY_SEND_LIMIT":
-			return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "Daily sending limit reached"}
-		case ae.Code == "SEND_NOT_ALLOWED" || ae.Code == "IMPERSONATION_READ_ONLY":
-			return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "Sending not allowed for this mailbox"}
 		case ae.Status == 429:
-			return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 7, 0}, Message: "Rate limited, try again later"}
+			// 配额 / 频率（DAILY_SEND_LIMIT、HOURLY_SEND_LIMIT、NEW_USER_SEND_LIMIT、SEND_LIMITER）：整封临时失败，
+			// 客户端稍后重发。/send 是整封一次调用，429 时一封都没发出去，重发不会重复。
+			// 回复只用 ASCII（主 API 的中文错误信息不直接塞进 SMTP 回复，部分客户端显示乱码），带上错误码便于排查
+			msg := "Sending quota exceeded, try again later"
+			if ae.Code != "" {
+				msg += " (" + ae.Code + ")"
+			}
+			return &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 7, 0}, Message: msg}
+		case ae.Code == "SEND_NOT_ALLOWED" || ae.Code == "IMPERSONATION_READ_ONLY" || ae.Code == "DOMAIN_DISABLED" || ae.Code == "SEND_SUSPENDED":
+			return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "Sending not allowed for this mailbox"}
 		case ae.Status == 400 || ae.Status == 404 || ae.Status == 410 || ae.Status == 413 || ae.Status == 422:
 			msg := ae.Msg
 			if msg == "" {

@@ -40,18 +40,19 @@ type mockEmail struct {
 }
 
 type mockAPI struct {
-	mu       sync.Mutex
-	emails   map[uint32]*mockEmail
-	sent     []map[string]any
-	uploads  int
-	logins   int
-	calls    []string
-	origin   string
-	nextID   uint32
-	tokens   map[string]bool // 有效令牌
-	readOnly map[string]bool
-	accounts []map[string]any
-	loginHdr []http.Header // 每次登录请求的请求头（检查 X-Proxy-Auth / X-Client-IP）
+	mu        sync.Mutex
+	emails    map[uint32]*mockEmail
+	sent      []map[string]any
+	sendCalls int // POST /api/email/send 的次数（含被拒的）
+	uploads   int
+	logins    int
+	calls     []string
+	origin    string
+	nextID    uint32
+	tokens    map[string]bool // 有效令牌
+	readOnly  map[string]bool
+	accounts  []map[string]any
+	loginHdr  []http.Header // 每次登录请求的请求头（检查 X-Proxy-Auth / X-Client-IP）
 }
 
 func newMockAPI() *mockAPI {
@@ -164,19 +165,14 @@ func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(p, "/api/email/accounts/") && strings.HasSuffix(p, "/emails"):
 		m.list(w, r, strings.TrimSuffix(strings.TrimPrefix(p, "/api/email/accounts/"), "/emails"))
 	case strings.HasPrefix(p, "/api/email/accounts/") && strings.HasSuffix(p, "/sent-emails"):
-		acc := strings.TrimSuffix(strings.TrimPrefix(p, "/api/email/accounts/"), "/sent-emails")
-		var out []map[string]any
-		for i, s := range m.sent {
-			if a, _ := s["accountId"].(string); a != "" && a != acc || a == "" && acc != "acc1" {
-				continue
-			}
-			out = append(out, map[string]any{"id": 500 + i, "to": s["to"], "subject": s["subject"], "status": "sent", "sentAt": "2026-10-02T10:00:00.000Z"})
-		}
-		jsonResp(w, 200, map[string]any{"emails": out, "hasMore": false})
+		// 旧的按邮箱接口：代理不应再调用（审查 M9），测试里断言调用次数为 0
+		jsonResp(w, 200, map[string]any{"emails": []any{}, "hasMore": false})
+	case p == "/api/email/sent-emails":
+		m.listSent(w, r)
 	case strings.HasPrefix(p, "/api/email/sent-emails/"):
 		i, _ := strconv.Atoi(strings.TrimPrefix(p, "/api/email/sent-emails/"))
 		s := m.sent[i-500]
-		jsonResp(w, 200, map[string]any{"email": map[string]any{"id": i, "to": s["to"], "subject": s["subject"], "htmlContent": s["html"], "sentAt": "2026-10-02T10:00:00.000Z"}})
+		jsonResp(w, 200, map[string]any{"email": map[string]any{"id": i, "to": joinAny(s["to"]), "cc": joinAny(s["cc"]), "subject": s["subject"], "htmlContent": s["html"], "sentAt": "2026-10-02T10:00:00Z"}})
 	case p == "/api/email/upload-attachment":
 		m.uploads++
 		f, h, err := r.FormFile("file")
@@ -189,7 +185,8 @@ func (m *mockAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case p == "/api/email/send":
 		var b map[string]any
 		json.NewDecoder(r.Body).Decode(&b)
-		if b["to"] == "blocked@example.net" {
+		m.sendCalls++
+		if strings.Contains(joinAny(b["to"])+","+joinAny(b["bcc"]), "blocked@example.net") {
 			jsonResp(w, 429, map[string]string{"error": "今日发信数量已达上限", "code": "DAILY_SEND_LIMIT"})
 			return
 		}
@@ -274,6 +271,58 @@ func (m *mockAPI) list(w http.ResponseWriter, r *http.Request, account string) {
 		next = strconv.Itoa(ids[len(ids)-1])
 	}
 	jsonResp(w, 200, map[string]any{"emails": out, "nextCursor": next, "hasMore": hasMore})
+}
+
+// joinAny：/send 的 to / cc / bcc 可以是字符串或数组，统一成逗号分隔串
+func joinAny(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case []any:
+		var out []string
+		for _, x := range t {
+			out = append(out, fmt.Sprint(x))
+		}
+		return strings.Join(out, ", ")
+	}
+	return ""
+}
+
+// GET /api/email/sent-emails?cursor=&limit=&accountId=：所有邮箱合并、id 倒序分页，行里带 accountId / fromAddress
+func (m *mockAPI) listSent(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	if limit <= 0 {
+		limit = 20
+	}
+	cursor, _ := strconv.Atoi(q.Get("cursor"))
+	names := map[string]string{}
+	for _, a := range m.accounts {
+		names[a["id"].(string)] = a["name"].(string)
+	}
+	var rows []map[string]any
+	for i := len(m.sent) - 1; i >= 0; i-- {
+		s := m.sent[i]
+		id := 500 + i
+		acc, _ := s["accountId"].(string)
+		if acc == "" {
+			acc = "acc1"
+		}
+		if a := q.Get("accountId"); a != "" && a != acc || cursor > 0 && id >= cursor {
+			continue
+		}
+		rows = append(rows, map[string]any{"id": id, "accountId": acc, "fromAddress": names[acc], "to": joinAny(s["to"]),
+			"subject": s["subject"], "status": "sent", "sentAt": "2026-10-02T10:00:00Z"})
+	}
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+	var next any
+	if hasMore {
+		next = strconv.Itoa(rows[len(rows)-1]["id"].(int))
+	}
+	jsonResp(w, 200, map[string]any{"emails": rows, "nextCursor": next, "hasMore": hasMore})
 }
 
 func (m *mockAPI) called(prefix string) int {
@@ -707,12 +756,15 @@ func TestSMTPSubmission(t *testing.T) {
 	if f.api.uploads != 1 {
 		t.Errorf("附件应上传 1 次（多个收件人复用），实际 %d", f.api.uploads)
 	}
-	if len(f.api.sent) != 2 {
-		t.Fatalf("应按收件人调用 /send 2 次，实际 %d", len(f.api.sent))
+	if f.api.sendCalls != 1 || len(f.api.sent) != 1 {
+		t.Fatalf("整封信应只调用 /send 1 次，实际 %d", f.api.sendCalls)
 	}
 	s := f.api.sent[0]
 	if s["accountId"] != "acc1" || s["subject"] != "你好" || !strings.Contains(s["html"].(string), "hello &lt;world&gt;") {
 		t.Errorf("/send 参数不对: %+v", s)
+	}
+	if joinAny(s["to"]) != "a@example.net" || joinAny(s["cc"]) != "b@example.net" || s["bcc"] != nil {
+		t.Errorf("To/Cc 应取自信头: to=%v cc=%v bcc=%v", s["to"], s["cc"], s["bcc"])
 	}
 	atts, _ := s["attachments"].([]any)
 	if len(atts) != 1 || !strings.HasPrefix(atts[0].(map[string]any)["url"].(string), "r2://uploads/") {
@@ -731,8 +783,11 @@ func TestSMTPSubmissionErrorsMapped(t *testing.T) {
 	w, _ := c.Data()
 	io.WriteString(w, "Subject: x\r\n\r\nhi\r\n")
 	err := w.Close()
-	if e, ok := err.(*smtp.SMTPError); !ok || e.Code != 550 {
-		t.Errorf("每日限额应映射为 550，得到 %v", err)
+	if e, ok := err.(*smtp.SMTPError); !ok || e.Code != 452 {
+		t.Errorf("API 429（每日限额）应整封回 452，得到 %v", err)
+	}
+	if f.api.sendCalls != 1 {
+		t.Errorf("/send 应只调用 1 次，实际 %d", f.api.sendCalls)
 	}
 }
 
@@ -828,6 +883,9 @@ func TestAppPasswordAccountLoginSeesAllMailboxes(t *testing.T) {
 	sel, err = c.Select("Sent", nil).Wait()
 	if err != nil || sel.NumMessages != 2 {
 		t.Fatalf("账户 Sent 应合并两个邮箱共 2 封: %v %+v", err, sel)
+	}
+	if n := f.api.called("GET /api/email/sent-emails"); n != 1 || f.api.called("GET /api/email/accounts/acc") != 0 {
+		t.Errorf("Sent 应只请求合并接口 /api/email/sent-emails（%d 次），不再逐个邮箱请求", n)
 	}
 	// 登录请求带共享密钥与真实客户端 IP
 	f.api.mu.Lock()
@@ -959,5 +1017,213 @@ func TestSMTPMailboxLoginSenderRestricted(t *testing.T) {
 	}
 	if err := c2.Mail("me@300031.xyz", nil); err != nil {
 		t.Errorf("账户登录应能用 me@300031.xyz 发信: %v", err)
+	}
+}
+
+// ---------- 审查 2026-10-09 M9 / M10 ----------
+
+// 已发送里只带 accountId 的请求：单邮箱登录
+func TestSentFolderMailboxLoginPassesAccountID(t *testing.T) {
+	f := startFixtureWith(t, 5, "app-password", "", withSecondMailbox)
+	c := dialIMAP(t, f.imapAddr, nil)
+	if err := c.Login("two@300031.xyz", testAppPW).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	sel, err := c.Select("Sent", nil).Wait()
+	if err != nil || sel.NumMessages != 1 {
+		t.Fatalf("单邮箱 Sent 应只有 1 封: %v %+v", err, sel)
+	}
+	f.api.mu.Lock()
+	var got []string
+	for _, cl := range f.api.calls {
+		if strings.HasPrefix(cl, "GET /api/email/sent-emails") {
+			got = append(got, cl)
+		}
+	}
+	f.api.mu.Unlock()
+	if len(got) != 1 {
+		t.Errorf("应请求 /api/email/sent-emails 1 次: %v", got)
+	}
+	msgs, err := c.Fetch(imap.SeqSetNum(1), &imap.FetchOptions{Envelope: true}).Collect()
+	if err != nil || len(msgs) != 1 || msgs[0].Envelope.Subject != "From two" ||
+		len(msgs[0].Envelope.From) != 1 || msgs[0].Envelope.From[0].Addr() != "two@300031.xyz" {
+		t.Errorf("Sent 的发件人应取自 fromAddress: %v %+v", err, msgs)
+	}
+}
+
+// 回归：第一个邮箱发信很多时，第二个邮箱较新的发信也要出现在 Sent（原来被前一个邮箱占满 500 的额度）
+func TestSentFolderNotStarvedByFirstMailbox(t *testing.T) {
+	f := startFixtureWith(t, 5, "login", "", func(m *mockAPI) {
+		m.accounts = append(m.accounts, map[string]any{"id": "acc2", "name": "two@300031.xyz", "type": "permanent"})
+		for i := 0; i < 600; i++ {
+			m.sent = append(m.sent, map[string]any{"accountId": "acc1", "to": "x@example.net", "subject": fmt.Sprintf("one-%d", i), "html": "<p>1</p>"})
+		}
+		m.sent = append(m.sent, map[string]any{"accountId": "acc2", "to": "y@example.net", "subject": "two newest", "html": "<p>2</p>"})
+	})
+	c := dialIMAP(t, f.imapAddr, nil)
+	c.Login("user@example.com", "pw").Wait()
+	sel, err := c.Select("Sent", nil).Wait()
+	if err != nil || sel.NumMessages != 500 {
+		t.Fatalf("Sent 应显示最新 500 封: %v %+v", err, sel)
+	}
+	if n := f.api.called("GET /api/email/sent-emails"); n != 5 {
+		t.Errorf("500 封按每页 100 应分 5 页请求，实际 %d", n)
+	}
+	msgs, err := c.Fetch(imap.SeqSetNum(500), &imap.FetchOptions{Envelope: true, UID: true}).Collect()
+	if err != nil || len(msgs) != 1 || msgs[0].Envelope.Subject != "two newest" {
+		t.Fatalf("最新一封应是第二个邮箱的发信: %v %+v", err, msgs)
+	}
+	if f.api.called("GET /api/email/accounts/acc") != 0 {
+		t.Error("不应再逐个邮箱请求 sent-emails")
+	}
+}
+
+func submitRaw(t *testing.T, f *fixture, from string, rcpts []string, raw string) error {
+	t.Helper()
+	c := smtpClient(t, f.smtpAddr)
+	if err := c.Auth(sasl.NewPlainClient("", "user@example.com", "pw")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Mail(from, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rcpts {
+		if err := c.Rcpt(r, nil); err != nil {
+			t.Fatalf("RCPT %s: %v", r, err)
+		}
+	}
+	w, err := c.Data()
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.WriteString(w, raw)
+	return w.Close()
+}
+
+func TestSMTPOneSendCallWithCcBccAndThreading(t *testing.T) {
+	f := startFixture(t, 5)
+	// 客户端把 Bcc 头也交上来了（部分客户端会这样）；References 折成两行；d@ 只在信封里
+	raw := "From: me@300031.xyz\r\nTo: \"A\" <a@example.net>, ghost@example.net\r\nCc: b@example.net\r\nBcc: c@example.net\r\n" +
+		"Subject: Re: hi\r\nIn-Reply-To: <orig-2@example.net>\r\n" +
+		"References: <root@example.net>\r\n <orig-2@example.net>\r\n" +
+		"Message-ID: <client-1@client>\r\n\r\nreply body\r\n"
+	if err := submitRaw(t, f, "me@300031.xyz", []string{"a@example.net", "B@example.net", "c@example.net", "d@example.net"}, raw); err != nil {
+		t.Fatalf("提交失败: %v", err)
+	}
+	f.api.mu.Lock()
+	defer f.api.mu.Unlock()
+	if f.api.sendCalls != 1 || len(f.api.sent) != 1 {
+		t.Fatalf("整封信应只请求 /send 1 次，实际 %d", f.api.sendCalls)
+	}
+	s := f.api.sent[0]
+	if got := joinAny(s["to"]); got != "a@example.net" {
+		t.Errorf("to 应只含信头 To 里且在信封中的地址（ghost 不在信封里，不发），得到 %q", got)
+	}
+	if got := joinAny(s["cc"]); got != "B@example.net" {
+		t.Errorf("cc 不对: %q", got)
+	}
+	if got := joinAny(s["bcc"]); got != "c@example.net, d@example.net" {
+		t.Errorf("bcc 应是信封里有、信头 To/Cc 里没有的收件人，得到 %q", got)
+	}
+	if s["inReplyTo"] != "<orig-2@example.net>" {
+		t.Errorf("inReplyTo 不对: %q", s["inReplyTo"])
+	}
+	if s["references"] != "<root@example.net> <orig-2@example.net>" {
+		t.Errorf("references 应原样转交并去掉折行: %q", s["references"])
+	}
+	// Bcc 只出现在 bcc 字段里：请求体不转交任何原始信头，其余字段里也不出现密送地址
+	allowed := map[string]bool{"accountId": true, "to": true, "cc": true, "bcc": true, "inReplyTo": true, "references": true, "subject": true, "html": true, "attachments": true}
+	for k, v := range s {
+		if !allowed[k] {
+			t.Errorf("请求体不应有字段 %q", k)
+		}
+		if k == "bcc" {
+			continue
+		}
+		b, _ := json.Marshal(v)
+		if strings.Contains(string(b), "c@example.net") || strings.Contains(string(b), "d@example.net") || strings.Contains(strings.ToLower(string(b)), "bcc") {
+			t.Errorf("密送地址不能出现在 %s 里: %s", k, b)
+		}
+	}
+}
+
+func TestSMTPAllBccUsesSenderAsTo(t *testing.T) {
+	f := startFixture(t, 5)
+	raw := "From: me@300031.xyz\r\nTo: undisclosed-recipients:;\r\nSubject: news\r\n\r\nhi\r\n"
+	if err := submitRaw(t, f, "me@300031.xyz", []string{"a@example.net", "b@example.net"}, raw); err != nil {
+		t.Fatalf("提交失败: %v", err)
+	}
+	s := f.api.sent[0]
+	if joinAny(s["to"]) != "me@300031.xyz" || joinAny(s["bcc"]) != "a@example.net, b@example.net" || f.api.sendCalls != 1 {
+		t.Errorf("全是密送时 to 应为发件人、其余进 bcc: %+v", s)
+	}
+}
+
+func TestSMTPThreadingHeaderInjectionDropped(t *testing.T) {
+	// 信头里没法直接塞裸 CR/LF，这里直接测规范化函数：任何换行都被拆开，非 <id> 片段丢弃
+	if got := messageIDList("<a@b>\r\nBcc: evil@x.com", 1); got != "<a@b>" {
+		t.Errorf("In-Reply-To 注入未被清掉: %q", got)
+	}
+	if got := messageIDList("<a@b> <c@d>", 1); got != "<a@b>" {
+		t.Errorf("In-Reply-To 只能有 1 个 id: %q", got)
+	}
+	if got := messageIDList("garbage (comment)", 50); got != "" {
+		t.Errorf("没有合法 id 时应为空: %q", got)
+	}
+	var ids []string
+	for i := 0; i < 60; i++ {
+		ids = append(ids, fmt.Sprintf("<r%d@x>", i))
+	}
+	got := strings.Fields(messageIDList(strings.Join(ids, "\r\n "), 50))
+	if len(got) != 50 || got[0] != "<r0@x>" || got[1] != "<r11@x>" || got[49] != "<r59@x>" {
+		t.Errorf("References 超过 50 个应保留第一个和最近 49 个: %v", got)
+	}
+	for _, g := range got {
+		if strings.ContainsAny(g, "\r\n") {
+			t.Fatal("References 不能含换行")
+		}
+	}
+}
+
+func TestSMTPBadRecipientRejectedAtRcpt(t *testing.T) {
+	f := startFixture(t, 5)
+	c := smtpClient(t, f.smtpAddr)
+	if err := c.Auth(sasl.NewPlainClient("", "user@example.com", "pw")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Mail("me@300031.xyz", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"user@-bad.net", "a@b", "a..b@example.net", ".a@example.net", "a@exa_mple.net"} {
+		err := c.Rcpt(bad, nil)
+		if e, ok := err.(*smtp.SMTPError); !ok || (e.Code != 553 && e.Code != 550) {
+			t.Errorf("格式错误的地址 %q 应在 RCPT 阶段回 550/553，得到 %v", bad, err)
+		}
+	}
+	// 坏地址不影响会话里的其他收件人；重复的 RCPT 只算一次
+	if err := c.Rcpt("ok@example.net", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Rcpt("OK@example.net", nil); err != nil {
+		t.Fatal(err)
+	}
+	w, _ := c.Data()
+	io.WriteString(w, "To: ok@example.net\r\nSubject: x\r\n\r\nhi\r\n")
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if joinAny(f.api.sent[0]["to"]) != "ok@example.net" || f.api.sent[0]["bcc"] != nil {
+		t.Errorf("收件人不对: %+v", f.api.sent[0])
+	}
+}
+
+func TestMaxRecipientsCappedAtAPILimit(t *testing.T) {
+	t.Setenv("MAX_RECIPIENTS", "500")
+	if o := loadOptions(); o.maxRcpts != apiMaxRecipients {
+		t.Errorf("MAX_RECIPIENTS 应被限制在 %d，得到 %d", apiMaxRecipients, o.maxRcpts)
+	}
+	t.Setenv("MAX_RECIPIENTS", "20")
+	if o := loadOptions(); o.maxRcpts != 20 {
+		t.Errorf("MAX_RECIPIENTS=20 应保持 20，得到 %d", o.maxRcpts)
 	}
 }

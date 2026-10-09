@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime"
 	"net/mail"
+	"regexp"
 	"strings"
 	"time"
 
@@ -126,6 +127,11 @@ type parsedSubmission struct {
 	Subject     string
 	HTML        string
 	Attachments []parsedAttachment
+	// 信头里的收件人（只取地址部分）。Bcc 头即使客户端带了也不读：密送收件人以信封为准，且不能出现在转交的信头里
+	To, Cc []string
+	// 会话串联信头：已规范成单行的 <msg-id>（空格分隔），不合法的部分被丢弃
+	InReplyTo  string
+	References string
 }
 
 type parsedAttachment struct {
@@ -143,6 +149,10 @@ func parseSubmission(raw []byte) (*parsedSubmission, error) {
 	if s, err := mr.Header.Subject(); err == nil {
 		out.Subject = s
 	}
+	out.To = headerAddrs(mr.Header, "To")
+	out.Cc = headerAddrs(mr.Header, "Cc")
+	out.InReplyTo = messageIDList(mr.Header.Get("In-Reply-To"), 1)
+	out.References = messageIDList(mr.Header.Get("References"), maxReferences)
 	var textBody, htmlBody string
 	for {
 		p, err := mr.NextPart()
@@ -202,4 +212,52 @@ func extFor(ct string) string {
 		return exts[0]
 	}
 	return ""
+}
+
+// headerAddrs 解析 To / Cc 信头里的地址（含组语法）。整体解析失败时按逗号逐个解析，跳过坏的那几个。
+func headerAddrs(h gomail.Header, key string) []string {
+	var out []string
+	if list, err := h.AddressList(key); err == nil {
+		for _, a := range list {
+			out = append(out, a.Address)
+		}
+		return out
+	}
+	raw := h.Get(key)
+	for _, p := range strings.Split(raw, ",") {
+		if a, err := mail.ParseAddress(strings.TrimSpace(p)); err == nil {
+			out = append(out, a.Address)
+		}
+	}
+	return out
+}
+
+// 与主 API messageIdListSchema 一致：每个 id 形如 <...>，不含空白和尖括号，最长 250
+var msgIDRe = regexp.MustCompile(`^<[^<>\s]{1,250}>$`)
+
+// References 最多 50 个 id（主 API 的上限）
+const maxReferences = 50
+
+// messageIDList 把 In-Reply-To / References 规范成单行、空格分隔的 <msg-id> 列表：
+// 折行（CRLF + 空白）和任何换行都变成空格，不合法的片段（注释、裸文本）丢弃。
+// 超过 max 个时保留第一个（会话根）和最近的 max-1 个（RFC 5322 3.6.4 的建议）。
+// In-Reply-To（max=1）只取第一个合法 id。
+func messageIDList(v string, max int) string {
+	var ids []string
+	for _, f := range strings.Fields(v) { // Fields 按 \r \n \t 空格切分，结果不会含换行
+		if msgIDRe.MatchString(f) {
+			ids = append(ids, f)
+		}
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	if len(ids) > max {
+		if max == 1 {
+			ids = ids[:1]
+		} else {
+			ids = append(ids[:1:1], ids[len(ids)-(max-1):]...)
+		}
+	}
+	return strings.Join(ids, " ")
 }
