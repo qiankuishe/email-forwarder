@@ -133,6 +133,11 @@ func main() {
 		log.Fatal("必须设置 TLS_CERT_FILE / TLS_KEY_FILE（IMAP/SMTP 会传输用户密码）")
 	}
 
+	if o.authMode != "app-password" {
+		// login 模式下每次 IMAP/SMTP 登录都调用网页登录接口，会把该用户的网页会话全部踢掉（审查 2026-10-09 L18②）
+		log.Printf("⚠️ AUTH_MODE=%s：客户端用网页登录密码登录，每次登录都会让该用户的网页会话失效；"+
+			"生产环境请设 AUTH_MODE=app-password（compose 中为 PROXY_AUTH_MODE），并让用户使用应用专用密码", o.authMode)
+	}
 	api := newAPIClient(o.apiBase, o.apiOrigin, o.authMode, o.appLoginPath)
 	api.proxySecret = o.proxySecret
 	if o.proxySecret == "" {

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 // probeEndpoint 的判定口径是收件链路能否真正投递的唯一自动化信号，
@@ -89,5 +90,24 @@ func TestProbeEndpointUnreachable(t *testing.T) {
 	ep := &Endpoint{WebhookURL: url, AuthToken: "test-token"}
 	if probeEndpoint(ep) {
 		t.Error("连接失败时应判为不健康")
+	}
+}
+
+// L18③（审查 2026-10-09）：webhook 客户端默认不走 HTTP(S)_PROXY，否则 safeControl 只检查到代理地址
+func TestWebhookClientIgnoresEnvProxyByDefault(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:3128")
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:3128")
+	t.Setenv("WEBHOOK_USE_ENV_PROXY", "")
+	tr, ok := newWebhookClient(time.Second).Transport.(*http.Transport)
+	if !ok {
+		t.Fatal("unexpected transport type")
+	}
+	if tr.Proxy != nil {
+		t.Fatal("webhook transport must not use the environment proxy by default")
+	}
+	t.Setenv("WEBHOOK_USE_ENV_PROXY", "true")
+	tr2 := newWebhookClient(time.Second).Transport.(*http.Transport)
+	if tr2.Proxy == nil {
+		t.Fatal("WEBHOOK_USE_ENV_PROXY=true should opt in to the environment proxy")
 	}
 }

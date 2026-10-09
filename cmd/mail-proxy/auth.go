@@ -130,12 +130,52 @@ var errRateLimited = errors.New("too many failed logins, try again later")
 // loginLimiter：按来源 IP 与按用户名分别计数的登录失败限流（内存，进程重启即清空）。
 // 主 API 自己也有登录限流与账户锁定，但它看到的来源 IP 全是这台 VPS，
 // 所以必须在代理这一层按真实客户端 IP 先挡一道，否则一个人爆破就会把所有用户一起锁死。
+//
+// 两张表都会定期清掉窗口外的记录（审查 2026-10-09 L18②：原来只在 allow 时清理当前键，
+// 用随机用户名请求会让 user 表无限增长）。条目数超过 maxTrackedKeys 时立即整表清理一次，
+// 仍超过就丢弃该表（按 IP 的计数照常生效，最多让按用户名的计数提前归零）。
 type loginLimiter struct {
 	mu       sync.Mutex
 	window   time.Duration
 	maxFails int
 	ip       map[string][]time.Time
 	user     map[string][]time.Time
+	ops      int
+}
+
+// maxTrackedKeys：每张表最多记录的键数
+const maxTrackedKeys = 50000
+
+// sweepEvery：每这么多次 fail 做一次整表清理
+const sweepEvery = 256
+
+// sweepLocked 删除窗口外的记录；调用方持有锁
+func (l *loginLimiter) sweepLocked(now time.Time) {
+	cutoff := now.Add(-l.window)
+	for _, m := range []map[string][]time.Time{l.ip, l.user} {
+		for k, ts := range m {
+			if ts = prune(ts, cutoff); len(ts) == 0 {
+				delete(m, k)
+			} else {
+				m[k] = ts
+			}
+		}
+	}
+	if len(l.user) > maxTrackedKeys {
+		log.Printf("⚠️ 登录限流：按用户名的记录超过 %d 条（疑似随机用户名爆破），已清空", maxTrackedKeys)
+		l.user = map[string][]time.Time{}
+	}
+	if len(l.ip) > maxTrackedKeys {
+		log.Printf("⚠️ 登录限流：按 IP 的记录超过 %d 条，已清空", maxTrackedKeys)
+		l.ip = map[string][]time.Time{}
+	}
+}
+
+// size 返回两张表当前的键数（测试用）
+func (l *loginLimiter) size() (int, int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.ip), len(l.user)
 }
 
 func newLoginLimiter(maxFails int, window time.Duration) *loginLimiter {
@@ -179,6 +219,10 @@ func (l *loginLimiter) fail(ip, user string) {
 	l.ip[ip] = append(l.ip[ip], now)
 	u := strings.ToLower(user)
 	l.user[u] = append(l.user[u], now)
+	l.ops++
+	if l.ops%sweepEvery == 0 || len(l.user) > maxTrackedKeys || len(l.ip) > maxTrackedKeys {
+		l.sweepLocked(now)
+	}
 }
 
 func (l *loginLimiter) success(ip, user string) {

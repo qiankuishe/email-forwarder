@@ -204,11 +204,23 @@ func safeControl(network, address string, _ syscall.RawConn) error {
 	return nil
 }
 
+// webhookProxy：webhook 客户端默认不走 HTTP(S)_PROXY 环境变量。
+// 走代理时 safeControl 检查的只是代理地址，目标是否内网无从得知，内网拦截形同虚设（审查 2026-10-09 L18③）。
+// 确实需要经代理出网时设 WEBHOOK_USE_ENV_PROXY=true（此时内网拦截只作用于代理本身，启动时会告警）。
+func webhookProxy() func(*http.Request) (*url.URL, error) {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("WEBHOOK_USE_ENV_PROXY"))) {
+	case "1", "true", "yes", "on":
+		log.Printf("⚠️ WEBHOOK_USE_ENV_PROXY=true：webhook 经 HTTP(S)_PROXY 发出，内网地址拦截只作用于代理地址本身")
+		return http.ProxyFromEnvironment
+	}
+	return nil
+}
+
 // 所有发往 webhook 的请求共用一个客户端：复用连接，并统一做内网拦截
 func newWebhookClient(timeout time.Duration) *http.Client {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, Control: safeControl}
 	tr := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 webhookProxy(),
 		DialContext:           dialer.DialContext,
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          50,
