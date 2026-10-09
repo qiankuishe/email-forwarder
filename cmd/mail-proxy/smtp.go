@@ -205,7 +205,7 @@ func (s *submissionSession) Data(r io.Reader) error {
 	// 整封信只调用一次 /send（审查 M10）：要么整封成功，要么整封失败，客户端重发不会让部分收件人收到两封。
 	to, cc, bcc := splitRecipients(s.from, s.rcpts, msg.To, msg.Cc)
 	req := &sendRequest{AccountID: s.accountID, To: to, Cc: cc, Bcc: bcc,
-		InReplyTo: msg.InReplyTo, References: msg.References,
+		InReplyTo: msg.InReplyTo, References: msg.References, MessageID: msg.MessageID,
 		Subject: msg.Subject, HTML: msg.HTML, Attachments: atts}
 	if err := s.us.call(c, func(tok string) error { return s.b.api.send(c, tok, req) }); err != nil {
 		log.Printf("发信失败 user=%s from=%s rcpts=%d: %v", s.us.user, s.from, len(s.rcpts), err)

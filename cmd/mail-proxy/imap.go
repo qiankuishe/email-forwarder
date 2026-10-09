@@ -77,6 +77,7 @@ type msgMeta struct {
 	subject string
 	from    string // 发件人（已发送文件夹为收件人）
 	sender  string // 仅已发送：发件邮箱地址（/api/email/sent-emails 的 fromAddress）
+	msgID   string // 仅已发送：真实 Message-ID（列表里就有，SEARCH HEADER Message-ID 不必下载原文）
 	size    int64
 }
 
@@ -288,7 +289,7 @@ func (s *imapSession) listFolder(f *folder, limit int) ([]*msgMeta, error) {
 			m.from = e.Sender + " " + e.SenderEmail
 		}
 		if isSent {
-			m.seen, m.date, m.from, m.sender = true, e.SentAt.Time, e.To, e.FromAddress
+			m.seen, m.date, m.from, m.sender, m.msgID = true, e.SentAt.Time, e.To, e.FromAddress, e.MessageID
 			if m.date.IsZero() {
 				m.date = e.CreatedAt.Time // 排队中 / 失败的发信没有 sentAt
 			}
@@ -642,13 +643,7 @@ func (s *imapSession) getRaw(m *msgMeta) ([]byte, error) {
 			return err
 		})
 		if err == nil {
-			to := d.To
-			from := m.sender
-			if from == "" {
-				from = s.fromForSent(c)
-			}
-			raw = buildMIME(from, to, strOr(d.Cc), d.Subject, d.SentAt.Time,
-				fmt.Sprintf("<sent-%d@mail-proxy>", d.ID), strOr(d.TextContent), strOr(d.HTMLContent))
+			raw = s.buildSent(c, m, d)
 		}
 	} else {
 		err = s.us.call(c, func(tok string) error {
@@ -668,8 +663,14 @@ func (s *imapSession) getRaw(m *msgMeta) ([]byte, error) {
 				if d.Sender != "" {
 					from = fmt.Sprintf("%q <%s>", d.Sender, d.SenderEmail)
 				}
-				raw = buildMIME(from, headerString(d.Headers, "to"), headerString(d.Headers, "cc"), d.Subject,
-					d.ReceivedAt.Time, headerString(d.Headers, "message-id"), strOr(d.TextContent), strOr(d.HTMLContent))
+				// 线程信头：主 API 的 headers JSON 是驼峰键（messageId / inReplyTo / references），
+				// 以前按 "message-id" 找不到，合成的信没有 Message-ID / In-Reply-To / References，会话断开
+				raw = buildMIMEHeaders(from, headerString(d.Headers, "to"), headerString(d.Headers, "cc"), d.Subject,
+					d.ReceivedAt.Time, messageIDList(headerString(d.Headers, "message-id"), 1), strOr(d.TextContent), strOr(d.HTMLContent),
+					map[string]string{
+						"In-Reply-To": messageIDList(headerString(d.Headers, "in-reply-to"), 1),
+						"References":  messageIDList(headerString(d.Headers, "references"), maxReferences),
+					})
 			}
 		}
 	}
@@ -679,6 +680,37 @@ func (s *imapSession) getRaw(m *msgMeta) ([]byte, error) {
 	m.size = int64(len(raw))
 	s.cache.put(key, raw)
 	return raw, nil
+}
+
+// buildSent 按已发送详情合成一封信。信头必须与真正发出去的那封一致：
+//   - Message-ID 用 sent_emails.message_id（客户端 APPEND 的本地副本、对方回信的 In-Reply-To 都指向它；
+//     以前写死成 <sent-N@mail-proxy>，iPhone 永远对不上，本地副本一直「正在加载」，会话也串不起来）
+//   - In-Reply-To / References 照原样带上，客户端才能把它归进会话
+//   - Date 用发送时间，排队中 / 失败的用创建时间（不能用 time.Now()，否则多次合成的字节数不同，RFC822.SIZE 对不上）
+func (s *imapSession) buildSent(c context.Context, m *msgMeta, d *apiEmailDetail) []byte {
+	from := m.sender
+	if from == "" {
+		from = s.fromForSent(c)
+	}
+	date := d.SentAt.Time
+	if date.IsZero() {
+		date = d.CreatedAt.Time
+	}
+	if date.IsZero() {
+		date = m.date
+	}
+	msgID := messageIDList(strOr(d.MessageID), 1)
+	if msgID == "" {
+		msgID = messageIDList(m.msgID, 1)
+	}
+	if msgID == "" {
+		msgID = fmt.Sprintf("<sent-%d@mail-proxy>", d.ID)
+	}
+	return buildMIMEHeaders(from, d.To, strOr(d.Cc), d.Subject, date, msgID, strOr(d.TextContent), strOr(d.HTMLContent),
+		map[string]string{
+			"In-Reply-To": messageIDList(strOr(d.InReplyTo), 1),
+			"References":  messageIDList(strOr(d.ReferencesHeader), maxReferences),
+		})
 }
 
 func (s *imapSession) fromForSent(c context.Context) string {
@@ -1061,6 +1093,14 @@ func (s *imapSession) match(seq uint32, m *msgMeta, c *imap.SearchCriteria, cand
 			if !strings.Contains(strings.ToLower(m.from), strings.ToLower(h.Value)) {
 				return false
 			}
+		case "message-id":
+			// 已发送的列表里带真实 Message-ID：iPhone APPEND 后按 Message-ID 找服务器副本，
+			// 不必为了比对信头把整个文件夹每封都下载一遍（数百次详情请求，客户端会一直等）
+			if m.msgID == "" {
+				needHeaderRaw = true
+			} else if !strings.Contains(strings.ToLower(m.msgID), strings.ToLower(h.Value)) {
+				return false
+			}
 		default:
 			needHeaderRaw = true
 		}
@@ -1080,7 +1120,7 @@ func (s *imapSession) match(seq uint32, m *msgMeta, c *imap.SearchCriteria, cand
 		if ent != nil {
 			for _, h := range c.Header {
 				k := strings.ToLower(h.Key)
-				if k == "subject" || k == "from" {
+				if k == "subject" || k == "from" || (k == "message-id" && m.msgID != "") {
 					continue
 				}
 				v := strings.ToLower(ent.Header.Get(h.Key))

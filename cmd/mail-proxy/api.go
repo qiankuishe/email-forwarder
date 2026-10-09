@@ -277,6 +277,7 @@ type apiEmailSummary struct {
 	SentAt      flexTime `json:"sentAt"`
 	CreatedAt   flexTime `json:"createdAt"`
 	FromAddress string   `json:"fromAddress"` // /api/email/sent-emails 每行的发件邮箱地址
+	MessageID   string   `json:"messageId"`   // /api/email/sent-emails 每行的真实 Message-ID
 	// 若主 API 将来在列表里返回原文大小（见 imap-api-needs.md），可避免为 RFC822.SIZE 下载原文
 	SizeBytes int64 `json:"sizeBytes"`
 }
@@ -297,10 +298,14 @@ type apiEmailDetail struct {
 	Headers     map[string]any    `json:"headers"`
 	ReceivedAt  flexTime          `json:"receivedAt"`
 	Attachments []json.RawMessage `json:"attachments"`
-	// 已发送详情
-	To     string   `json:"to"`
-	Cc     *string  `json:"cc"`
-	SentAt flexTime `json:"sentAt"`
+	// 已发送详情（GET /api/email/sent-emails/:id 返回 sent_emails 整行）
+	To               string   `json:"to"`
+	Cc               *string  `json:"cc"`
+	SentAt           flexTime `json:"sentAt"`
+	CreatedAt        flexTime `json:"createdAt"`
+	MessageID        *string  `json:"messageId"`        // 发出去那封信的真实 Message-ID
+	InReplyTo        *string  `json:"inReplyTo"`        // 回复时的 In-Reply-To
+	ReferencesHeader *string  `json:"referencesHeader"` // 回复时的 References
 }
 
 // ---------- 业务调用：全部是对现有接口的直接转发 ----------
@@ -425,12 +430,15 @@ func (c *apiClient) uploadAttachment(ctx context.Context, token, filename, conte
 // to / cc / bcc 是地址数组（每项最多 100 个）；bcc 只进信封，主 API 不会把它写进信头；
 // inReplyTo（1 个 <id>）/ references（最多 50 个 <id>，空格分隔）不能含换行。
 type sendRequest struct {
-	AccountID   string               `json:"accountId"`
-	To          []string             `json:"to"`
-	Cc          []string             `json:"cc,omitempty"`
-	Bcc         []string             `json:"bcc,omitempty"`
-	InReplyTo   string               `json:"inReplyTo,omitempty"`
-	References  string               `json:"references,omitempty"`
+	AccountID  string   `json:"accountId"`
+	To         []string `json:"to"`
+	Cc         []string `json:"cc,omitempty"`
+	Bcc        []string `json:"bcc,omitempty"`
+	InReplyTo  string   `json:"inReplyTo,omitempty"`
+	References string   `json:"references,omitempty"`
+	// 客户端信头里的 Message-ID：主 API 发信与 sent_emails 都用它（并按它去重），
+	// 这样客户端 APPEND 到「已发送」的本地副本能和代理合成的服务器副本对上（Message-ID 相同）
+	MessageID   string               `json:"messageId,omitempty"`
 	Subject     string               `json:"subject"`
 	HTML        string               `json:"html"`
 	Attachments []uploadedAttachment `json:"attachments,omitempty"`

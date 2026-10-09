@@ -17,6 +17,11 @@ import (
 // buildMIME 在主 API 没有原文（旧数据 / 已发送邮件）时，按详情 JSON 合成一封 RFC 5322 邮件。
 // 只在内存里生成，用完即弃。
 func buildMIME(from, to, cc, subject string, date time.Time, msgID string, text, htmlBody string) []byte {
+	return buildMIMEHeaders(from, to, cc, subject, date, msgID, text, htmlBody, nil)
+}
+
+// buildMIMEHeaders 同 buildMIME，另外写入 extra 里的非空信头（值须已校验、不含换行）
+func buildMIMEHeaders(from, to, cc, subject string, date time.Time, msgID string, text, htmlBody string, extra map[string]string) []byte {
 	var buf bytes.Buffer
 	var h gomail.Header
 	if date.IsZero() {
@@ -35,6 +40,11 @@ func buildMIME(from, to, cc, subject string, date time.Time, msgID string, text,
 	h.SetSubject(subject)
 	if msgID != "" {
 		h.Set("Message-Id", msgID)
+	}
+	for _, k := range []string{"In-Reply-To", "References"} {
+		if v := extra[k]; v != "" && !strings.ContainsAny(v, "\r\n") {
+			h.Set(k, v)
+		}
 	}
 
 	if htmlBody == "" && text == "" {
@@ -92,9 +102,14 @@ func parseAddrs(s string) []*gomail.Address {
 	return out
 }
 
+// headerKey 规整信头名：主 API 的 headers JSON 用驼峰（messageId / inReplyTo），这里也接受 message-id 写法
+func headerKey(k string) string {
+	return strings.ToLower(strings.NewReplacer("-", "", "_", "").Replace(k))
+}
+
 func headerString(h map[string]any, key string) string {
 	for k, v := range h {
-		if strings.EqualFold(k, key) {
+		if headerKey(k) == headerKey(key) {
 			switch t := v.(type) {
 			case string:
 				return t
@@ -132,6 +147,8 @@ type parsedSubmission struct {
 	// 会话串联信头：已规范成单行的 <msg-id>（空格分隔），不合法的部分被丢弃
 	InReplyTo  string
 	References string
+	// 客户端生成的 Message-ID（单个 <id>，不合法则为空）
+	MessageID string
 }
 
 type parsedAttachment struct {
@@ -153,6 +170,7 @@ func parseSubmission(raw []byte) (*parsedSubmission, error) {
 	out.Cc = headerAddrs(mr.Header, "Cc")
 	out.InReplyTo = messageIDList(mr.Header.Get("In-Reply-To"), 1)
 	out.References = messageIDList(mr.Header.Get("References"), maxReferences)
+	out.MessageID = messageIDList(mr.Header.Get("Message-Id"), 1)
 	var textBody, htmlBody string
 	for {
 		p, err := mr.NextPart()
@@ -244,7 +262,8 @@ const maxReferences = 50
 // In-Reply-To（max=1）只取第一个合法 id。
 func messageIDList(v string, max int) string {
 	var ids []string
-	for _, f := range strings.Fields(v) { // Fields 按 \r \n \t 空格切分，结果不会含换行
+	// 按空白和逗号切分（结果不会含换行）：主 API 存 References 时把多个 id 用 ", " 连接，部分客户端也会这样写
+	for _, f := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\r' || r == '\n' }) {
 		if msgIDRe.MatchString(f) {
 			ids = append(ids, f)
 		}
