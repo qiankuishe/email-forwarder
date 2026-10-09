@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -133,7 +134,7 @@ var errRateLimited = errors.New("too many failed logins, try again later")
 //
 // 两张表都会定期清掉窗口外的记录（审查 2026-10-09 L18②：原来只在 allow 时清理当前键，
 // 用随机用户名请求会让 user 表无限增长）。条目数超过 maxTrackedKeys 时立即整表清理一次，
-// 仍超过就丢弃该表（按 IP 的计数照常生效，最多让按用户名的计数提前归零）。
+// 仍超过就淘汰失败次数最少 / 最旧的记录，缩到 3/4（审查第二轮 L13②，不再整表清空）。
 type loginLimiter struct {
 	mu       sync.Mutex
 	window   time.Duration
@@ -162,13 +163,46 @@ func (l *loginLimiter) sweepLocked(now time.Time) {
 		}
 	}
 	if len(l.user) > maxTrackedKeys {
-		log.Printf("⚠️ 登录限流：按用户名的记录超过 %d 条（疑似随机用户名爆破），已清空", maxTrackedKeys)
-		l.user = map[string][]time.Time{}
+		n := evictLocked(l.user, maxTrackedKeys*3/4)
+		log.Printf("⚠️ 登录限流：按用户名的记录超过 %d 条（疑似随机用户名爆破），已淘汰 %d 条失败最少 / 最旧的记录", maxTrackedKeys, n)
 	}
 	if len(l.ip) > maxTrackedKeys {
-		log.Printf("⚠️ 登录限流：按 IP 的记录超过 %d 条，已清空", maxTrackedKeys)
-		l.ip = map[string][]time.Time{}
+		n := evictLocked(l.ip, maxTrackedKeys*3/4)
+		log.Printf("⚠️ 登录限流：按 IP 的记录超过 %d 条，已淘汰 %d 条失败最少 / 最旧的记录", maxTrackedKeys, n)
 	}
+}
+
+// evictLocked 把表缩到 keep 条：先淘汰失败次数最少的，同样次数时淘汰最近一次失败最早的（审查第二轮 L13②）。
+// 以前超限就整表清空，攻击者用随机用户名刷满后，正被爆破的用户的计数也一起归零；
+// 现在被集中爆破的键（失败次数多）会留下来。返回淘汰条数。
+func evictLocked(m map[string][]time.Time, keep int) int {
+	if len(m) <= keep {
+		return 0
+	}
+	type entry struct {
+		key  string
+		n    int
+		last time.Time
+	}
+	all := make([]entry, 0, len(m))
+	for k, ts := range m {
+		var last time.Time
+		if len(ts) > 0 {
+			last = ts[len(ts)-1]
+		}
+		all = append(all, entry{k, len(ts), last})
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].n != all[j].n {
+			return all[i].n < all[j].n
+		}
+		return all[i].last.Before(all[j].last)
+	})
+	drop := len(m) - keep
+	for _, e := range all[:drop] {
+		delete(m, e.key)
+	}
+	return drop
 }
 
 // size 返回两张表当前的键数（测试用）

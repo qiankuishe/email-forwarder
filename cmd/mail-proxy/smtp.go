@@ -105,7 +105,9 @@ func (s *submissionSession) Mail(from string, opts *smtp.MailOptions) error {
 	return &smtp.SMTPError{Code: 553, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "Sender address not owned by authenticated user"}
 }
 
-// apiMaxRecipients：主 API /send 的 to / cc / bcc 每项最多 100 个地址；代理的 MAX_RECIPIENTS 不得超过它
+// apiMaxRecipients：主 API 单封收件人的硬顶（To+Cc+Bcc 合计 100，send-policy.ts HARD_MAX_RECIPIENTS）；
+// 代理的 MAX_RECIPIENTS 不得超过它。主 API 后台 outbound.limits.maxRecipients 默认 20（审查第二轮 H1），
+// 与代理的默认 MAX_RECIPIENTS=20 一致；管理员调高后台上限时再同步调高 MAX_RECIPIENTS
 const apiMaxRecipients = 100
 
 // 与主 API 的 z.string().email()（zod 4）同一套规则，格式不合法的地址在 RCPT 阶段就拒绝，
@@ -215,27 +217,40 @@ func (s *submissionSession) Data(r io.Reader) error {
 	return nil
 }
 
+// asciiReply：SMTP 回复只用 ASCII（RFC 5321 4.2；主 API 的中文错误信息不直接塞进回复，部分客户端显示乱码），
+// 带上主 API 的错误码便于排查。审查第二轮 L9
+func asciiReply(msg, code string) string {
+	if code != "" {
+		msg += " (" + code + ")"
+	}
+	return msg
+}
+
 func smtpErrFromAPI(err error) error {
 	var ae *apiError
 	if errors.As(err, &ae) {
 		switch {
 		case ae.Status == 429:
-			// 配额 / 频率（DAILY_SEND_LIMIT、HOURLY_SEND_LIMIT、NEW_USER_SEND_LIMIT、SEND_LIMITER）：整封临时失败，
+			// 配额 / 频率（DAILY_SEND_LIMIT、HOURLY_SEND_LIMIT、NEW_USER_SEND_LIMIT、SEND_RATE_LIMIT、SEND_LIMITER）：整封临时失败，
 			// 客户端稍后重发。/send 是整封一次调用，429 时一封都没发出去，重发不会重复。
-			// 回复只用 ASCII（主 API 的中文错误信息不直接塞进 SMTP 回复，部分客户端显示乱码），带上错误码便于排查
-			msg := "Sending quota exceeded, try again later"
-			if ae.Code != "" {
-				msg += " (" + ae.Code + ")"
-			}
-			return &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 7, 0}, Message: msg}
+			return &smtp.SMTPError{Code: 452, EnhancedCode: smtp.EnhancedCode{4, 7, 0}, Message: asciiReply("Sending quota exceeded, try again later", ae.Code)}
 		case ae.Code == "SEND_NOT_ALLOWED" || ae.Code == "IMPERSONATION_READ_ONLY" || ae.Code == "DOMAIN_DISABLED" || ae.Code == "SEND_SUSPENDED":
-			return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: "Sending not allowed for this mailbox"}
-		case ae.Status == 400 || ae.Status == 404 || ae.Status == 410 || ae.Status == 413 || ae.Status == 422:
-			msg := ae.Msg
-			if msg == "" {
-				msg = "Message rejected"
-			}
-			return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 6, 0}, Message: msg}
+			return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 7, 1}, Message: asciiReply("Sending not allowed for this mailbox", ae.Code)}
+		case ae.Code == "SEND_FAILED_PERMANENT":
+			// 中继永久拒收（例如全部收件人 550 地址不存在）：554，客户端不再反复重发（审查第二轮 M4）
+			return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 0, 0}, Message: asciiReply("Message rejected by the outbound relay", ae.Code)}
+		case ae.Code == "SEND_FAILED_TEMPORARY":
+			return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 4, 0}, Message: asciiReply("Outbound relay temporarily unavailable, try again later", ae.Code)}
+		case ae.Code == "RECIPIENT_SUPPRESSED":
+			return &smtp.SMTPError{Code: 550, EnhancedCode: smtp.EnhancedCode{5, 1, 1}, Message: asciiReply("Recipient is on the suppression list", ae.Code)}
+		case ae.Code == "TOO_MANY_RECIPIENTS":
+			return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 5, 3}, Message: asciiReply("Too many recipients", ae.Code)}
+		case ae.Status == 410:
+			return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 1, 0}, Message: asciiReply("Mailbox expired", ae.Code)}
+		case ae.Status == 400 || ae.Status == 404 || ae.Status == 413 || ae.Status == 422:
+			return &smtp.SMTPError{Code: 554, EnhancedCode: smtp.EnhancedCode{5, 6, 0}, Message: asciiReply("Message rejected", ae.Code)}
+		case ae.Status == 502 || ae.Status >= 500:
+			return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0}, Message: asciiReply("Backend temporarily unavailable", ae.Code)}
 		}
 	}
 	return &smtp.SMTPError{Code: 451, EnhancedCode: smtp.EnhancedCode{4, 3, 0}, Message: "Backend temporarily unavailable"}

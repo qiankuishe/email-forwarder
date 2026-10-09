@@ -260,8 +260,20 @@ docker compose --profile proxy up -d
 | `IDLE_POLL_SECONDS` | 60（最小 10） | IDLE 期间轮询主 API 的间隔 |
 | `LOGIN_MAX_FAILS` / `LOGIN_FAIL_WINDOW_MINUTES` | 5 / 15 | 单 IP 失败上限（单用户名为其 2 倍） |
 | `MAX_CONNECTIONS` / `MAX_CONNECTIONS_PER_IP` | 500 / 20 | 连接上限 |
-| `MAX_RECIPIENTS` | 20 | 单封信收件人上限（不能超过主 API 的 100，超过按 100 处理；主 API 后台 `outbound.limits.maxRecipients` 默认 50，也会拦截） |
+| `MAX_RECIPIENTS` | 20 | 单封信收件人上限（To+Cc+Bcc；不能超过主 API 的硬顶 100，超过按 100 处理）。主 API 后台 `outbound.limits.maxRecipients` 默认 20，调高后台上限时同步调高这里。主 API 的每日 / 每小时配额按收件人计 |
 | `ACCOUNT_FOLDERS` | `true` | 整个账户登录时是否为每个邮箱单独列出 `Accounts/<地址>` 文件夹（单邮箱登录永不列出） |
+
+发信失败时的 SMTP 回复（主 API `/send` 的错误码 → 代理回复，回复只用 ASCII，括号里带错误码）：
+
+| 主 API | 代理回复 | 客户端行为 |
+| --- | --- | --- |
+| `502 SEND_FAILED_PERMANENT`（中继在信封 / 正文阶段 5xx 拒收，例如全部收件人 550） | `554 5.0.0` | 不再重发 |
+| `502 SEND_FAILED_TEMPORARY`（连接 / 认证 / 超时 / 4xx） | `451 4.4.0` | 稍后重发 |
+| `429`（每日 / 每小时 / 新用户配额，均按收件人计；频率限制） | `452 4.7.0` | 稍后重发 |
+| `422 RECIPIENT_SUPPRESSED` | `550 5.1.1` | 不再重发 |
+| `400 TOO_MANY_RECIPIENTS` / 校验失败、`410` 邮箱过期 | `554` | 不再重发 |
+
+单个收件人被中继拒收（例如地址不存在）时，其余收件人照常投递，`/send` 返回 200 并带 `rejectedRecipients`，代理回 `250`；被拒的地址记在「已发送」那封信的错误说明里。
 
 ### 客户端 DNS 与自动配置
 

@@ -40,3 +40,26 @@ func TestLoginLimiterCapsTrackedKeys(t *testing.T) {
 		t.Fatal("IP over limit should be blocked")
 	}
 }
+
+// 审查第二轮 L13②：超限时淘汰失败最少 / 最旧的记录，被集中爆破的用户名计数保留
+func TestLoginLimiterEvictionKeepsHotKeys(t *testing.T) {
+	l := newLoginLimiter(5, time.Hour)
+	for i := 0; i < 5; i++ {
+		l.fail("203.0.113.1", "victim@example.com")
+	}
+	for i := 0; i <= maxTrackedKeys; i++ {
+		l.fail(fmt.Sprintf("ip-%d", i%100), fmt.Sprintf("r%d", i))
+	}
+	if _, users := l.size(); users > maxTrackedKeys {
+		t.Fatalf("users = %d, want <= %d", users, maxTrackedKeys)
+	}
+	l.mu.Lock()
+	n := len(l.user["victim@example.com"])
+	l.mu.Unlock()
+	if n != 5 {
+		t.Fatalf("被集中爆破的用户名计数不应被淘汰：got %d, want 5", n)
+	}
+	if l.allow("198.51.100.77", "victim@example.com") == false {
+		t.Fatal("5 次失败 < 用户名阈值 10，仍应允许")
+	}
+}
